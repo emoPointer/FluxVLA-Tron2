@@ -1,0 +1,26 @@
+Third-Party Attribution for xvla_models
+
+Source projects:
+- X-VLA
+  Project code: https://github.com/2toINF/X-VLA
+  Upstream ref noted in local headers:
+  origin/main@6bc2513f5f1cbec715cc668b414392a6cae5c671
+  License noted in local headers: Apache-2.0
+
+- Microsoft / Hugging Face Florence-2 model files
+  Local files preserve the original Microsoft and Hugging Face copyright and
+  Apache-2.0 license headers.
+
+Covered local files:
+- fluxvla/models/third_party_models/xvla_models/configuration_florence2.py
+- fluxvla/models/third_party_models/xvla_models/modeling_florence2.py
+- fluxvla/models/backbones/vlms/florence2.py
+- fluxvla/models/vlas/x_vla.py
+- fluxvla/models/heads/xvla_head.py
+- fluxvla/models/heads/xvla_action_spaces.py
+
+License notes:
+- Please preserve upstream copyright notices, SPDX identifiers, and origin
+  comments when modifying redistributed or adapted files.
+- For release/legal review, verify final compatibility with repository
+  distribution policy.

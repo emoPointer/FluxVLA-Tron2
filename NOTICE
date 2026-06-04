@@ -1,0 +1,67 @@
+FluxVLA Engine
+Copyright 2026 LimX Dynamics
+
+This project is licensed under the Apache License, Version 2.0.
+See the LICENSE file for the full license text.
+
+This NOTICE file is informational and does not modify the license terms.
+
+Third-party software and references
+-----------------------------------
+
+FluxVLA depends on third-party open-source libraries for model training,
+evaluation, simulation, data processing, and remote inference. A preliminary
+direct dependency license review is maintained in:
+
+    docs/release_license_review.md
+
+Bundled or adapted third-party source/model-support files include:
+
+- DreamZero modules
+  Source: https://github.com/dreamzero0/dreamzero
+  Upstream path: groot/vla/model/dreamzero/modules
+  License noted in local attribution: Apache-2.0
+  Local attribution: fluxvla/models/third_party_models/dreamzero/ATTRIBUTION.txt
+
+- Alibaba Wan Video (Wan2.1) modules
+  Source: https://github.com/Wan-Video/Wan2.1
+  License noted in local attribution: Apache-2.0
+  Local attribution: fluxvla/models/third_party_models/dreamzero/ATTRIBUTION.txt
+
+- Hugging Face Diffusers scheduler code
+  Source: https://github.com/huggingface/diffusers
+  Upstream ref noted in local attribution: v0.31.0
+  License noted in local attribution: Apache-2.0
+  Local attribution: fluxvla/models/third_party_models/dreamzero/ATTRIBUTION.txt
+
+- NVIDIA Isaac-GR00T Eagle2 model support files
+  Source: https://github.com/NVIDIA/Isaac-GR00T
+  Upstream ref noted in local attribution: n1.5-release
+  Local attribution:
+  fluxvla/models/third_party_models/eagle2_hg_model/ATTRIBUTION.txt
+
+- X-VLA / Florence-2 model support and adapted components
+  Source: https://github.com/2toINF/X-VLA
+  Upstream ref noted in local attribution:
+  origin/main@6bc2513f5f1cbec715cc668b414392a6cae5c671
+  License noted in local attribution: Apache-2.0
+  Local attribution:
+  fluxvla/models/third_party_models/xvla_models/ATTRIBUTION.txt
+
+Model checkpoints and datasets
+------------------------------
+
+This source repository does not include private model checkpoints, training
+outputs, or private datasets. Local paths such as checkpoints/, datasets/, and
+work_dirs/ are ignored by Git and are expected to be populated by users.
+
+Public datasets and checkpoints referenced in the documentation are hosted by
+their respective publishers and remain subject to their own licenses and terms.
+
+Release note
+------------
+
+Before each public release, maintainers should review this NOTICE file together
+with docs/release_license_review.md and confirm that third-party code, model
+assets, datasets, and documentation examples remain within the approved public
+release boundary.
