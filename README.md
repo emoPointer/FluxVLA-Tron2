@@ -505,14 +505,15 @@ but real action execution cannot.
 
 ## 9. Run Remote Inference in Dry Run Mode
 
-Dry run is the default in the Tron2 LoRA config:
+The checked-in private deployment config currently enables real actions:
 
 ```python
-dry_run=True
+dry_run=False
 ```
 
-Dry run performs the full perception and remote inference flow but does not
-execute actions:
+For dry-run validation, explicitly override it with
+`inference.dry_run=True`. Dry run performs the full perception and remote
+inference flow but does not execute actions:
 
 ```text
 ROS observations -> SSH tunnel -> GPU inference -> action returned -> print
@@ -530,7 +531,8 @@ bash scripts/remote_inference_client.sh \
   --ssh-host USER@SERVER_PUBLIC_IP \
   --ssh-port 22 \
   --local-port 5555 \
-  --remote-port 3333
+  --remote-port 3333 \
+  --cfg-options inference.dry_run=True
 ```
 
 If the server is reachable only through port 22, keep this SSH tunnel mode.

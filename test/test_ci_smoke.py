@@ -18,7 +18,7 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parents[1]
 
 
-def test_tron2_lora_config_public_defaults():
+def test_tron2_lora_config_deployment_defaults():
     cfg_path = (
         ROOT / 'configs' / 'pi05' / 'pi05_paligemma_tron2_lora_finetune.py')
     cfg = runpy.run_path(cfg_path)
@@ -28,7 +28,8 @@ def test_tron2_lora_config_public_defaults():
     assert cfg['model']['use_lora'] is True
     assert cfg['model']['ori_action_dim'] == 16
     assert inference['action_layout'] == 'tron2_16'
-    assert inference['dry_run'] is True
+    # This private deployment configuration intentionally enables real actions.
+    assert inference['dry_run'] is False
     assert inference['enable_head_control'] is False
     assert inference['remote_inference']['server_host'] == '127.0.0.1'
     assert inference['remote_inference']['server_port'] == 5555

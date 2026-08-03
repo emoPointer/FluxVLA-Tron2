@@ -24,6 +24,16 @@ from fluxvla.engines.utils.robot_utils import (invert_gripper_action,
                                                normalize_gripper_action)
 
 
+def _align_stat_vector(values, target_dim: int, name: str) -> np.ndarray:
+    """Align a statistics vector with the active state/action dimension."""
+    vector = np.asarray(values)
+    if vector.ndim != 1 or vector.shape[0] < target_dim:
+        raise ValueError(
+            f"Statistic '{name}' has shape {vector.shape}, but at least "
+            f'{target_dim} values are required.')
+    return vector[:target_dim]
+
+
 @TRANSFORMS.register_module()
 class Normalize:
     """Normalize the data using provided statistics.
@@ -181,14 +191,17 @@ class DenormalizeLiberoAction:
         if self.action_dim is not None:
             normalized_action = normalized_action[..., :self.action_dim]
 
+        target_dim = normalized_action.shape[-1]
+        action_mean = _align_stat_vector(stats['mean'], target_dim, 'mean')
+        action_std = _align_stat_vector(stats['std'], target_dim, 'std')
+
         if 'mask' in stats:
-            mask = np.array(stats['mask'])
+            mask = _align_stat_vector(stats['mask'], target_dim, 'mask')
         else:
-            mask = np.ones_like(stats['mean'], dtype=bool)
+            mask = np.ones(target_dim, dtype=bool)
         action = np.where(
-            mask,
-            normalized_action * np.array(stats['std']) +
-            np.array(stats['mean']), normalized_action)
+            mask, normalized_action * action_std + action_mean,
+            normalized_action)
         return action
 
     def _denormalize_quantile(self, normalized_action: np.ndarray,
@@ -197,13 +210,14 @@ class DenormalizeLiberoAction:
         assert 'q99' in stats and stats['q99'] is not None
         if self.action_dim is not None:
             normalized_action = normalized_action[..., :self.action_dim]
+        target_dim = normalized_action.shape[-1]
+        action_high = _align_stat_vector(stats['q99'], target_dim, 'q99')
+        action_low = _align_stat_vector(stats['q01'], target_dim, 'q01')
         if self.action_norm_mask is not None:
-            mask = np.array(self.action_norm_mask)
+            mask = _align_stat_vector(self.action_norm_mask, target_dim,
+                                      'action_norm_mask')
         else:
-            mask = np.ones_like(stats['q01'], dtype=bool)  # noqa: E501
-        action_high = np.array(stats['q99'])
-        action_low = np.array(stats['q01'])
-        mask = np.array(mask)
+            mask = np.ones(target_dim, dtype=bool)
         action = np.where(
             mask,
             0.5 * (normalized_action + 1) * (action_high - action_low) +
@@ -217,13 +231,14 @@ class DenormalizeLiberoAction:
         assert 'max' in stats and stats['max'] is not None
         if self.action_dim is not None:
             normalized_action = normalized_action[..., :self.action_dim]
+        target_dim = normalized_action.shape[-1]
+        action_high = _align_stat_vector(stats['max'], target_dim, 'max')
+        action_low = _align_stat_vector(stats['min'], target_dim, 'min')
         if self.action_norm_mask is not None:
-            mask = np.array(self.action_norm_mask)
+            mask = _align_stat_vector(self.action_norm_mask, target_dim,
+                                      'action_norm_mask')
         else:
-            mask = np.ones_like(stats['min'], dtype=bool)
-        action_high = np.array(stats['max'])
-        action_low = np.array(stats['min'])
-        mask = np.array(mask)
+            mask = np.ones(target_dim, dtype=bool)
         action = np.where(
             mask,
             0.5 * (normalized_action + 1) * (action_high - action_low) +
@@ -402,10 +417,14 @@ class NormalizeStatesAndActions:
         return data
 
     def _normalize(self, x, stats: Dict, norm_mask: List[bool] = None):
+        target_dim = x.shape[-1]
+        mean = _align_stat_vector(stats['mean'], target_dim, 'mean')
+        std = _align_stat_vector(stats['std'], target_dim, 'std')
         if norm_mask is None:
-            norm_mask = [True] * x.shape[-1]
-        return np.where(norm_mask, (x - np.array(stats['mean'])) /
-                        (np.array(stats['std']) + 1e-6), x)
+            norm_mask = np.ones(target_dim, dtype=bool)
+        else:
+            norm_mask = _align_stat_vector(norm_mask, target_dim, 'norm_mask')
+        return np.where(norm_mask, (x - mean) / (std + 1e-6), x)
 
     def _normalize_quantile(self,
                             x,
@@ -413,22 +432,28 @@ class NormalizeStatesAndActions:
                             norm_mask: List[bool] = None):
         assert stats['q01'] is not None
         assert stats['q99'] is not None
+        target_dim = x.shape[-1]
+        high = _align_stat_vector(stats['q99'], target_dim, 'q99')
+        low = _align_stat_vector(stats['q01'], target_dim, 'q01')
         if norm_mask is None:
-            norm_mask = [True] * x.shape[-1]
+            norm_mask = np.ones(target_dim, dtype=bool)
+        else:
+            norm_mask = _align_stat_vector(norm_mask, target_dim, 'norm_mask')
         return np.where(
-            norm_mask, (x - np.array(stats['q01'])) /
-            (np.array(stats['q99']) - np.array(stats['q01']) + 1e-6) * 2.0 -
-            1.0, x)
+            norm_mask, (x - low) / (high - low + 1e-6) * 2.0 - 1.0, x)
 
     def _normalize_min_max(self, x, stats: Dict, norm_mask: List[bool] = None):
         assert 'min' in stats and stats['min'] is not None
         assert 'max' in stats and stats['max'] is not None
+        target_dim = x.shape[-1]
+        high = _align_stat_vector(stats['max'], target_dim, 'max')
+        low = _align_stat_vector(stats['min'], target_dim, 'min')
         if norm_mask is None:
-            norm_mask = [True] * x.shape[-1]
+            norm_mask = np.ones(target_dim, dtype=bool)
+        else:
+            norm_mask = _align_stat_vector(norm_mask, target_dim, 'norm_mask')
         return np.where(
-            norm_mask, (x - np.array(stats['min'])) /
-            (np.array(stats['max']) - np.array(stats['min']) + 1e-6) * 2.0 -
-            1.0, x)
+            norm_mask, (x - low) / (high - low + 1e-6) * 2.0 - 1.0, x)
 
 
 @TRANSFORMS.register_module()
