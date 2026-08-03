@@ -69,8 +69,9 @@ datasets/*
 # Ignore vscode directories
 .vscode/
 
-# Ignore local experiment directories
-src/
+# Ignore the root-level editable VCS dependency directory while keeping
+# package-owned source directories such as fluxvla/ops/cuda/*/src trackable.
+/src/
 
 # Coding assistants' stuff
 .agents/

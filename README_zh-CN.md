@@ -467,13 +467,15 @@ WebSocket，但真实动作执行必须依赖它。
 
 ## 9. Dry Run
 
-Tron2 LoRA 配置默认：
+当前提交的私有部署配置会启用真实动作：
 
 ```python
-dry_run=True
+dry_run=False
 ```
 
-dry run 会完成完整感知和远程推理链路，但不会执行机器人动作：
+如需进行 dry-run 验证，必须显式覆盖
+`inference.dry_run=True`。dry run 会完成完整感知和远程推理链路，但不会执行
+机器人动作：
 
 ```text
 ROS observations -> SSH tunnel -> GPU inference -> action returned -> print
@@ -491,7 +493,8 @@ bash scripts/remote_inference_client.sh \
   --ssh-host USER@SERVER_PUBLIC_IP \
   --ssh-port 22 \
   --local-port 5555 \
-  --remote-port 3333
+  --remote-port 3333 \
+  --cfg-options inference.dry_run=True
 ```
 
 如果服务器只能通过 22 端口访问，保留 SSH tunnel 模式。若已配置 SSH key，
