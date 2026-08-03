@@ -230,3 +230,72 @@ commands and results that were actually executed.
   of this configuration on the Power Computing Module must be synchronized or
   overridden there before the change affects its client. The GPU inference
   service is intentionally stopped and must be started manually before use.
+
+## 2026-08-04 01:49 CST — Synchronize step-030000 checkpoint
+
+- Purpose: copy the latest requested training checkpoint from the training
+  server into the matching local work directory without modifying or stopping
+  the remote training job.
+- Operation:
+  - confirmed the remote checkpoint was a regular file and recorded its size,
+    modification time, and SHA-256 digest before transfer;
+  - confirmed the local target did not already exist and that approximately
+    789 GiB of disk space was available;
+  - transferred the file over SSH with resumable rsync using partial-file and
+    append-verification support. One transient SSH disconnect occurred at about
+    79%; rsync retained the partial file and resumed successfully;
+  - copied only
+    `work_dirs/pi05_two_tasks_lora_rank256_20260803_170124/checkpoints/step-030000-epoch-016-loss=0.0020.safetensors`;
+    no remote file or training process was modified.
+- Validation:
+  - rsync completed with exit code 0 after the resumed transfer;
+  - remote and local sizes are both 14,466,989,776 bytes;
+  - remote and local modification times both resolve to
+    `2026-08-04 01:09:49.082775268 +0800`;
+  - the independently computed remote and local SHA-256 digests both equal
+    `2a363378d51b7969b8165576be5273bcda26f92c5fcab19e648698d1b50f588a`;
+  - `git check-ignore` confirmed the checkpoint remains excluded through the
+    existing `work_dirs` ignore rule and was not staged or committed.
+
+## 2026-08-04 01:55 CST — Publish repository to a private personal GitHub repo
+
+- Purpose: configure GitHub CLI for the workstation and publish the current
+  source repository to the user's personal account with private visibility.
+- Configuration and scope:
+  - installed official GitHub CLI 2.97.0 under `$HOME/.local/bin` after
+    verifying the release archive against the official checksum file;
+  - authenticated the personal GitHub account `emoPointer`, configured the
+    repository-local commit identity with the GitHub noreply address, and added
+    the workstation's existing ED25519 public key to that account. The private
+    key was not read or uploaded;
+  - created `emoPointer/FluxVLA-Tron2` and verified its visibility was
+    `PRIVATE`;
+  - kept the original `clearlab-sustech/FluxVLA-Tron2` remote as `upstream`
+    and configured the personal private repository as `origin`;
+  - inspected staged and untracked files, searched for common credential
+    patterns, and confirmed that checkpoints, work directories, datasets,
+    environment files, and the nested `src/libero` checkout remained ignored.
+- Publication:
+  - committed the reviewed deployment, dependency, CUDA-source, normalization,
+    test, and documentation changes as local commit `02c9ff5`;
+  - normal HTTPS Git push stalled in the network's chunked receive-pack path;
+    a fixed-length retry also stalled, and GitHub SSH on ports 22 and 443 was
+    blocked after connection establishment;
+  - initialized the empty private repository with a temporary bootstrap commit,
+    then used the GitHub Git Database API to upload 415 unique blobs, validating
+    every returned Git object SHA;
+  - recreated the initial and deployment trees. Their remote SHA values exactly
+    matched the local trees (`cc3a1e1` and `889f511`), then moved `main` to the
+    recreated deployment commit, leaving the bootstrap file outside the final
+    branch tree;
+  - the API-generated commit SHA differs from the local SHA because GitHub
+    serialized the commit metadata differently, but the full file-tree SHA is
+    identical. The published deployment tree contains 418 files.
+- Validation:
+  - `pytest -q test/test_transforms/test_normalize.py test/test_ci_smoke.py`:
+    6 passed with five existing third-party warnings;
+  - Python compilation and `git diff --check` passed;
+  - repository visibility, default branch, remote commit, remote tree, and file
+    count were queried again through the authenticated GitHub API;
+  - no checkpoint, dataset, secret, or local environment file was included in
+    the GitHub tree.
