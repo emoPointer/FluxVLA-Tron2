@@ -561,10 +561,12 @@ Number of times to repeat the task: 1
 In dry-run mode, the prepare-pose command is not executed; this only verifies
 the interaction flow before real execution.
 
-Expected dry-run output includes a printed action:
+Expected dry-run output includes the overlap timing configuration. Dry run
+still consumes the simulated action queue at 30 Hz, but never opens the robot
+control transport:
 
 ```text
-[Tron2InferenceRunner] dry_run=True, skip execution.
+[Overlap] Started: chunk=50, execution_horizon=25, trigger_queue=25, blend=0.00->1.00
 ```
 
 ## 10. Execute on the Robot
@@ -588,12 +590,13 @@ bash scripts/remote_inference_client.sh \
   --cfg-options inference.dry_run=False inference.execute_horizon=4
 ```
 
-`inference.execute_horizon=4` means the robot executes only the first 4 action
-steps from each action chunk, then observes and queries the remote server again.
-This is safer for initial deployment.
+With a repeat count of 1, `inference.execute_horizon=4` limits the first real
+test to four 30 Hz policy frames. For continuous overlap runs it also controls
+the interval between inference starts; validate end-to-end inference latency
+in dry run before using such a short interval repeatedly.
 
-After the behavior is verified, remove `execute_horizon=4` to execute the full
-chunk:
+After the behavior is verified, remove the override to use the default
+25-frame overlap interval:
 
 ```bash
 bash scripts/remote_inference_client.sh \
@@ -605,13 +608,22 @@ bash scripts/remote_inference_client.sh \
   --cfg-options inference.dry_run=False
 ```
 
-The current config uses:
+The default deployment uses overlapping chunks:
 
 ```python
-action_chunk=32
+type='Tron2OverlapInferenceRunner'
+action_chunk=50
+execute_horizon=25
+blend_start_weight=0.0
+blend_end_weight=1.0
 ```
 
-so the default execution horizon is the full 32-step chunk.
+The client obtains a fresh observation after 25 frames, continues executing
+the old plan during remote inference, aligns the returned chunk by the number
+of frames actually consumed, and cross-fades arm targets from old to new. The
+last requested chunk is limited to the execution horizon; grippers switch
+between old/new values rather than being averaged. The GPU server still runs
+ordinary FluxVLA inference, and the robot client remains model-free.
 
 ## 11. Move to the Prepare Pose
 
@@ -642,7 +654,7 @@ by the Tron2 controller is canceled.
 For first deployment on a new robot:
 
 - keep one operator near the physical emergency stop;
-- use `inference.execute_horizon=4`;
+- use `inference.execute_horizon=4` with repeat count 1;
 - keep object placement conservative;
 - verify gripper open/close convention before full-speed runs;
 - keep `max_servoj_step_rad=0.2` until recorded trajectories justify a tighter
@@ -731,7 +743,7 @@ The most important runtime switches are:
 | ----------------------------- | ---------------------------------------- |
 | `inference.dry_run=True`      | full inference flow, no robot action     |
 | `inference.dry_run=False`     | execute returned actions on the robot    |
-| `inference.execute_horizon=4` | execute only the first 4 steps per chunk |
+| `inference.execute_horizon=25` | frames between overlap inference starts |
 | `inference.operator.ws_port`  | Tron2 WebSocket controller port          |
 | `inference.operator.servoj_publish_rate` | ServoJ background rate (300 Hz) |
 | `inference.operator.max_servoj_step_rad` | Per-waypoint delta guard (rad) |

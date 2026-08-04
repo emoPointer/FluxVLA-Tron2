@@ -46,7 +46,11 @@ def load_deployment_metadata(cfg, ckpt_path: str) -> dict:
     fallback for older work directories.
     """
     runtime_inference = getattr(cfg, 'inference', {})
-    is_tron2 = runtime_inference.get('type') == 'Tron2InferenceRunner'
+    is_tron2 = runtime_inference.get('type') in {
+        'Tron2InferenceRunner',
+        'Tron2OverlapInferenceRunner',
+        'Tron2RTCInferenceRunner',
+    }
     checkpoint_work_dir = Path(ckpt_path).resolve().parent.parent
     metadata = {
         'task_descriptions': dict(runtime_inference.get(

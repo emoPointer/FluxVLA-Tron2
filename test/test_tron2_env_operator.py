@@ -244,6 +244,40 @@ def test_prepare_uses_movej_then_policy_uses_servoj():
     assert controller.gripper_calls == [(100.0, 50.0), (90.0, 40.0)]
 
 
+def test_execute_waypoint_reuses_controller_without_chunk_wait():
+    transport = FakeTransport()
+    operator = make_operator([transport])
+
+    operator.execute_waypoint(
+        left_arm=np.full(7, 0.01),
+        right_arm=np.full(7, -0.01),
+        left_gripper=0.8,
+        right_gripper=0.4,
+        dt=1.0,
+    )
+    controller = operator._motion_controller
+    operator.execute_waypoint(
+        left_arm=np.full(7, 0.02),
+        right_arm=np.full(7, -0.02),
+        left_gripper=0.7,
+        right_gripper=0.3,
+        dt=1.0,
+    )
+
+    assert operator._motion_controller is controller
+    assert len(controller.commands) == 2
+    np.testing.assert_allclose(
+        controller.commands[-1][0],
+        np.concatenate([
+            np.full(7, 0.02),
+            np.full(7, -0.02),
+            np.zeros(2),
+        ]),
+    )
+    assert controller.commands[-1][1] == pytest.approx(1.0)
+    assert controller.gripper_calls == [(80.0, 40.0), (70.0, 30.0)]
+
+
 def test_movej_disconnects_active_servoj_controller():
     first_transport = FakeTransport()
     second_transport = FakeTransport()

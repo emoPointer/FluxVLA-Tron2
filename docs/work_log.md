@@ -639,3 +639,112 @@ commands and results that were actually executed.
     values `startup_mismatch_limit=0.5` and `waypoint_limit=0.2`;
   - local and PCM SHA-256 digests matched for both synchronized files.
 - No client, WebSocket control session, or robot action was started.
+
+## 2026-08-04 16:10 CST — Add client-side latency-aligned overlapping action chunks
+
+- Objective: hide remote inference latency without moving model inference onto
+  the GPU-less robot PCM, and reduce discontinuities between independently
+  predicted action chunks.
+- Implementation:
+  - added `Tron2OverlapInferenceRunner`, with a 30 Hz consumer that requests a
+    fresh observation/new 50-frame chunk after 25 frames have been consumed;
+  - snapshots the old executable remainder at observation time and uses the
+    queue's actual consumed-index delta while inference is in flight, rather
+    than relying only on a wall-clock latency estimate;
+  - linearly cross-fades the overlapping left/right arm joints from the old
+    plan to the new plan; gripper dimensions switch plans at the blend midpoint
+    and are never numerically averaged;
+  - limits the final chunk to one 25-frame execution horizon, so a repeat count
+    of `N` contributes `N * 25` policy frames when the queue does not underrun;
+  - added non-blocking single-waypoint submission to `Tron2EnvOperator`. The
+    runner owns the 30 Hz policy clock while the persistent
+    `tron2_env.MotionController` continues interpolation and ServoJ publishing
+    at 300 Hz;
+  - a queue underrun lasting more than three control ticks is a hard failure.
+    The existing live `0.2`-rad ServoJ waypoint guard, joint limits, gripper
+    validation, connection checks, head lock, and startup-only `0.5`-rad
+    Bridge/control source check remain active.
+- Configuration and compatibility:
+  - the PI0.5 LoRA deployment config now selects the overlap runner with
+    `action_chunk=50`, `execute_horizon=25`, `publish_rate=30`, and
+    `dry_run=False`;
+  - runner registration, client dependency preflight, server-side Tron2
+    metadata recognition for future starts, deployment documentation, and
+    regression tests were updated;
+  - the ZMQ request/response protocol and GPU model service are unchanged. The
+    already-running service on PID 170467 / port 3333 was left running and does
+    not need a restart for this client-side queue algorithm.
+- Validation actually executed:
+  - `pytest -q test/test_ci_smoke.py test/test_tron2_env_operator.py` passed all
+    25 tests with five existing third-party warnings;
+  - focused Python compilation, remote-client-only runner/`ActionQueue` import,
+    launcher `bash -n`, config parsing, and `git diff --check` passed;
+  - backed up replaced PCM files under
+    `/home/guest/FluxVLA-Tron2/.sync-backups/20260804-overlap.8KBKMD`, then
+    synchronized the lightweight client/operator/config/launcher files to
+    `guest@10.192.1.4`;
+  - PCM compilation and remote-client-only import passed. The final overlap
+    runner SHA-256 matched locally and on the PCM:
+    `630bf26d383a3ba21c2de09fedd7e0009e0e9d9a58995b72f7daab2046b61091`.
+- Remaining risk: no live Bridge observation, inference episode, MoveJ,
+  ServoJ, gripper command, or robot-control WebSocket was started for this
+  change. End-to-end latency and boundary diagnostics must therefore be
+  inspected first in dry-run mode, followed by a short real run; real-robot
+  continuity has not yet been validated.
+
+## 2026-08-04 16:24 CST — Diagnose stale first Bridge observation after pose change
+
+- Symptom: the first overlap-runner waypoint was blocked before ServoJ startup
+  because ServoJ joint 10 differed by `1.5589` rad between the cached Bridge
+  state (`-0.0021`) and current control-WebSocket state (`-1.5610`), above the
+  startup-only `0.5`-rad source-consistency limit.
+- Root cause: `Tron2EnvOperator` consumes and stores one aligned observation
+  during construction as `_pending_bridge_observation`. Interactive task input
+  and an optional task-ID-0 MoveJ happen afterwards, but the first policy
+  observation still returns that startup sample. The safety check therefore
+  compares a pre-pose-change Bridge state with post-pose-change live control
+  feedback.
+- Read-only evidence collected on the PCM:
+  - no MotionController was created and no MoveJ, ServoJ, head, or gripper
+    command was issued;
+  - one fresh Bridge/control pair had matching 18-D layouts and values; the
+    previously failing joint was approximately `-1.5610` on both sources and
+    the maximum observed difference was approximately `0.0001` rad;
+  - both observation and control transports were closed after the sample.
+- Safety result: the pre-start check behaved correctly and rejected the stale
+  comparison before the 300 Hz ServoJ publisher was created. Increasing or
+  disabling the threshold would hide the stale-observation bug and is not an
+  appropriate fix.
+- Remaining work: invalidate the startup sample after any pose change, or
+  always drain the Bridge provider for a fresh observation before the first
+  inference/action cross-check. No code or configuration was changed during
+  this diagnosis.
+
+## 2026-08-04 16:30 CST — Diagnose head motion during ServoJ publisher startup
+
+- Symptom: after the stale-observation case was avoided, startup source checks
+  passed and `MotionController` started, but the immediate post-start check
+  measured head joint 0 moving `0.1376` rad from its locked position, above the
+  `0.05`-rad hold limit. The controller disconnected and the episode stopped.
+- Execution boundary: the first policy waypoint and gripper command had not yet
+  been submitted. The only active command path was MotionController's 300 Hz
+  initial hold publication, which sends the measured 16-D
+  `[left arm, right arm, head]` target through `request_servoj`.
+- Read-only evidence collected afterwards:
+  - with only `WebsocketTransport` state polling active and no MotionController,
+    1,000 head samples over about two seconds were exactly stable at
+    `[1.0465, -0.0056]` after feedback initialization;
+  - the installed `tron2_env` startup logic matches its public upstream source:
+    it seeds the interpolator from measured state and starts publishing the
+    complete 16-D setpoint immediately;
+  - therefore the observed head change is specific to entering ServoJ / sending
+    the initial full-state hold frame on this robot, not policy head output,
+    overlap blending, repeat count, or passive head drift.
+- Safety result: the post-start head check detected the unwanted movement,
+  disconnected the publisher, and prevented the policy waypoint from being
+  issued. Relaxing `max_head_hold_error_rad` would permit the observed head
+  motion and is not an appropriate workaround.
+- Remaining issue: the current robot firmware/control endpoint must be checked
+  for the exact head semantics of the 16-D `request_servoj` command, or an
+  arms-only ServoJ path must be used if supported. No code/configuration was
+  changed and no command-based reproduction was attempted during diagnosis.

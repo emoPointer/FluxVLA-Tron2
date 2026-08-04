@@ -18,6 +18,8 @@ if os.getenv('FLUXVLA_REMOTE_CLIENT_ONLY', '0') == '1':
     from .base_inference_runner import BaseInferenceRunner  # noqa: F401, F403
     from .tron2_inference_runner import \
         Tron2InferenceRunner  # noqa: F401, F403
+    from .tron2_overlap_inference_runner import \
+        Tron2OverlapInferenceRunner  # noqa: F401, F403
 else:
     from .aloha_inference_runner import \
         AlohaInferenceRunner  # noqa: F401, F403
@@ -31,6 +33,8 @@ else:
         LiberoInferenceRunner  # noqa: F401, F403
     from .tron2_inference_runner import \
         Tron2InferenceRunner  # noqa: F401, F403
+    from .tron2_overlap_inference_runner import \
+        Tron2OverlapInferenceRunner  # noqa: F401, F403
     from .tron2_rtc_inference_runner import \
         Tron2RTCInferenceRunner  # noqa: F401, F403
     from .ur_inference_runner import URInferenceRunner  # noqa: F401, F403

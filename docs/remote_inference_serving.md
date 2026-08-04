@@ -197,6 +197,7 @@ by adding `remote_inference` to its config:
 | `URInferenceRunner`       | UR3/UR5 single-arm   |
 | `AlohaInferenceRunner`    | Aloha dual-arm       |
 | `AlohaRTCInferenceRunner` | Aloha dual-arm + RTC |
+| `Tron2OverlapInferenceRunner` | TRON2 dual-arm + client-side overlap blending |
 
 ### Client config options (remote_inference dict)
 

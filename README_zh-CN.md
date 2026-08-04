@@ -516,10 +516,10 @@ Number of times to repeat the task: 1
 
 dry run 不会真正执行 prepare pose，只验证真实执行前的交互流程。
 
-期望输出包含：
+dry run 仍会按 30 Hz 消费模拟动作队列，但不会连接机器人控制接口。预期日志包括：
 
 ```text
-[Tron2InferenceRunner] dry_run=True, skip execution.
+[Overlap] Started: chunk=50, execution_horizon=25, trigger_queue=25, blend=0.00->1.00
 ```
 
 ## 10. 真实执行
@@ -543,10 +543,11 @@ bash scripts/remote_inference_client.sh \
   --cfg-options inference.dry_run=False inference.execute_horizon=4
 ```
 
-`inference.execute_horizon=4` 表示每个 action chunk 只执行前 4 步，然后重新
-观测并请求远程推理。初次部署更安全。
+repeat count 为 1 时，`inference.execute_horizon=4` 会把第一次真机测试限制为
+4 个 30 Hz policy 帧。连续重叠运行时，这个值同时表示相邻两次推理开始之间的
+帧数；反复使用较短间隔前，必须先在 dry run 中确认端到端推理延迟。
 
-确认行为稳定后，可以去掉 `execute_horizon=4`：
+确认行为稳定后，可以去掉该覆盖项，使用默认的 25 帧重叠间隔：
 
 ```bash
 bash scripts/remote_inference_client.sh \
@@ -558,13 +559,20 @@ bash scripts/remote_inference_client.sh \
   --cfg-options inference.dry_run=False
 ```
 
-当前配置：
+当前配置使用重叠 action chunk：
 
 ```python
-action_chunk=32
+type='Tron2OverlapInferenceRunner'
+action_chunk=50
+execute_horizon=25
+blend_start_weight=0.0
+blend_end_weight=1.0
 ```
 
-默认执行完整 32 步 action chunk。
+客户端执行 25 帧后获取新观测；远程推理期间继续执行旧计划；返回后按照实际已经
+消费的帧数对齐新 chunk，并让手臂关节目标从旧计划渐变到新计划。最后一次请求只
+执行一个 execution horizon。夹爪在旧值和新值之间切换而不取平均。GPU 服务器
+仍然执行普通 FluxVLA 推理，机器人客户端不加载模型。
 
 ## 11. 进入初始位姿
 
@@ -591,7 +599,7 @@ WebSocket，但它仍然不是机器人急停：不会自动卸力，也不能�
 新机器人首次部署时：
 
 - 操作员应在物理急停旁；
-- 使用 `inference.execute_horizon=4`；
+- 使用 `inference.execute_horizon=4`，并将 repeat count 设为 1；
 - 物体摆放保守；
 - 完整运行前先确认夹爪开合约定；
 - 在有实测轨迹支持更严格阈值前，保持 `max_servoj_step_rad=0.2`。
@@ -675,7 +683,7 @@ scripts/remote_inference_client.sh
 | ----------------------------- | -------------------------------- |
 | `inference.dry_run=True`      | 完成推理链路，但不执行机器人动作 |
 | `inference.dry_run=False`     | 在机器人上执行返回动作           |
-| `inference.execute_horizon=4` | 每个 chunk 只执行前 4 步         |
+| `inference.execute_horizon=25` | 相邻重叠推理开始之间的帧数      |
 | `inference.operator.ws_port`  | Tron2 WebSocket 控制端口         |
 | `inference.operator.servoj_publish_rate` | ServoJ 后台发布频率（300 Hz） |
 | `inference.operator.max_servoj_step_rad` | 相邻路点变化上限（rad） |

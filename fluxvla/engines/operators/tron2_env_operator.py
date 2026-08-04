@@ -710,10 +710,49 @@ class Tron2EnvOperator:
             self._traj_thread = None
             self._run_servoj_trajectory(*args)
 
+    def execute_waypoint(self,
+                         left_arm,
+                         right_arm,
+                         left_gripper,
+                         right_gripper,
+                         head=None,
+                         dt: float = 0.1):
+        """Validate and submit one policy waypoint without blocking for ``dt``.
+
+        The overlap inference runner owns the 30 Hz action clock, while the
+        persistent ``tron2_env`` MotionController interpolates and publishes
+        ServoJ commands at its configured high rate. Every waypoint still
+        passes the same live-feedback, joint-limit, gripper, and head-lock
+        checks as a complete trajectory.
+        """
+        self._validate_positive('dt', dt)
+        left = np.asarray(left_arm, dtype=np.float64).reshape(1, -1)
+        right = np.asarray(right_arm, dtype=np.float64).reshape(1, -1)
+        left_gripper = np.asarray([left_gripper], dtype=np.float64)
+        right_gripper = np.asarray([right_gripper], dtype=np.float64)
+        head_trajectory = None
+        if head is not None:
+            head_trajectory = np.asarray(head, dtype=np.float64).reshape(1, -1)
+
+        self.stop_trajectory()
+        self._traj_stop_event = threading.Event()
+        self._trajectory_error = None
+        self._traj_thread = None
+        self._run_servoj_trajectory(
+            left,
+            right,
+            left_gripper,
+            right_gripper,
+            head_trajectory,
+            float(dt),
+            self._traj_stop_event,
+            pace=False,
+        )
+
     def _run_servoj_trajectory(self, left_arm_trajectory, right_arm_trajectory,
                                left_gripper_trajectory,
                                right_gripper_trajectory, head_trajectory, dt,
-                               stop_event):
+                               stop_event, pace=True):
         try:
             with self._control_lock:
                 controller = self._motion_controller
@@ -763,10 +802,11 @@ class Tron2EnvOperator:
                 )
                 controller.command_joints(waypoint, eta=dt)
 
-                deadline = start + (index + 1) * dt
-                remaining = deadline - time.perf_counter()
-                if remaining > 0:
-                    stop_event.wait(remaining)
+                if pace:
+                    deadline = start + (index + 1) * dt
+                    remaining = deadline - time.perf_counter()
+                    if remaining > 0:
+                        stop_event.wait(remaining)
         except Exception as exc:
             self._trajectory_error = exc
             stop_event.set()

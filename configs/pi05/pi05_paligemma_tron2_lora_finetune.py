@@ -241,11 +241,16 @@ runner = dict(
     change_key_name=False)
 
 inference = dict(
-    type='Tron2InferenceRunner',
+    type='Tron2OverlapInferenceRunner',
     action_layout='tron2_16',
     dry_run=False,
     publish_rate=30,
     enable_head_control=False,
+    async_execution=False,
+    execute_horizon=25,
+    blend_start_weight=0.0,
+    blend_end_weight=1.0,
+    max_queue_empty_steps=3,
     remote_inference=dict(
         server_host='127.0.0.1',
         server_port=5555,
@@ -285,7 +290,7 @@ inference = dict(
         norm_type='min_max',
         action_dim=16,
     ),
-    action_chunk=32,
+    action_chunk=50,
     operator=dict(
         type='Tron2EnvOperator',
         bridge_host='wss://10.192.1.4',
