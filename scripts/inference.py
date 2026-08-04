@@ -54,5 +54,8 @@ if __name__ == '__main__':
     cfg.inference.cfg = cfg
     cfg.inference.ckpt_path = args.ckpt_path
     inference_runner = build_runner_from_cfg(cfg.inference)
-    inference_runner.run_setup()
-    inference_runner.run()
+    try:
+        inference_runner.run_setup()
+        inference_runner.run()
+    finally:
+        inference_runner.cleanup()

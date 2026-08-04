@@ -183,7 +183,7 @@ class Tron2Operator:
         if self.connect_websocket:
             self._init_websocket()
         else:
-            print('Tron2Operator WebSocket disabled '
+            print(f'{type(self).__name__} built-in WebSocket disabled '
                   '(connect_websocket=False)')
 
         self.json_encoder = NumpySafeEncoder

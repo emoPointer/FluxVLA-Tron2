@@ -15,8 +15,10 @@
 import os
 
 if os.getenv('FLUXVLA_REMOTE_CLIENT_ONLY', '0') == '1':
+    from .tron2_env_operator import Tron2EnvOperator  # noqa: F401, F403
     from .tron2_operator import Tron2Operator  # noqa: F401, F403
 else:
     from .aloha_operator import AlohaOperator  # noqa: F401, F403
+    from .tron2_env_operator import Tron2EnvOperator  # noqa: F401, F403
     from .tron2_operator import Tron2Operator  # noqa: F401, F403
     from .ur_operator import UROperator  # noqa: F401, F403

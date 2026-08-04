@@ -80,35 +80,87 @@ USAGE
     exit 1
 fi
 
-TUNNEL_PID=""
+export FLUXVLA_REMOTE_CLIENT_ONLY=1
+export PYTHONPATH="$(pwd):${PYTHONPATH}"
+
+PYTHON_BIN="${FLUXVLA_PYTHON:-}"
+if [ -z "$PYTHON_BIN" ]; then
+    if command -v python >/dev/null 2>&1; then
+        PYTHON_BIN="$(command -v python)"
+    elif [ -x "${HOME}/.venvs/fluxvla-tron2/bin/python" ]; then
+        PYTHON_BIN="${HOME}/.venvs/fluxvla-tron2/bin/python"
+    else
+        echo "[client] ERROR: no Python interpreter found."
+        echo "[client] Activate the lightweight client environment or set FLUXVLA_PYTHON."
+        exit 1
+    fi
+fi
+
+if ! "$PYTHON_BIN" -c \
+    "import tron2_env, websockets; from fluxvla.engines.operators import Tron2EnvOperator"; then
+    echo "[client] ERROR: lightweight client imports failed with $PYTHON_BIN."
+    echo "[client] Install the pinned tron2-env bridge runtime (websockets>=12)."
+    exit 1
+fi
+
+TUNNEL_CONTROL_DIR=""
+TUNNEL_CONTROL_SOCKET=""
 cleanup() {
-    if [ -n "$TUNNEL_PID" ]; then
-        echo "[client] Closing SSH tunnel (pid=$TUNNEL_PID)..."
-        kill "$TUNNEL_PID" 2>/dev/null || true
+    if [ -n "$TUNNEL_CONTROL_SOCKET" ] && [ -S "$TUNNEL_CONTROL_SOCKET" ]; then
+        echo "[client] Closing SSH tunnel..."
+        ssh -S "$TUNNEL_CONTROL_SOCKET" -O exit "$SSH_HOST" >/dev/null 2>&1 || true
+    fi
+    if [ -n "$TUNNEL_CONTROL_DIR" ] && [ -d "$TUNNEL_CONTROL_DIR" ]; then
+        rmdir "$TUNNEL_CONTROL_DIR" 2>/dev/null || true
     fi
 }
 trap cleanup EXIT
 
 if [ -n "$SSH_HOST" ]; then
-    SSH_CMD="ssh"
-    [ -n "$SSH_KEY" ]  && SSH_CMD="$SSH_CMD -i $SSH_KEY"
-    SSH_CMD="$SSH_CMD -p $SSH_PORT -L ${LOCAL_PORT}:127.0.0.1:${REMOTE_PORT} $SSH_HOST -N"
+    if command -v ss >/dev/null 2>&1; then
+        PORT_LISTENERS=$(ss -H -ltnp "( sport = :${LOCAL_PORT} )" 2>/dev/null || true)
+        if [ -n "$PORT_LISTENERS" ]; then
+            echo "[client] ERROR: local port ${LOCAL_PORT} is already in use:"
+            echo "$PORT_LISTENERS"
+            echo "[client] Stop the existing client/tunnel or choose another --local-port."
+            exit 1
+        fi
+    fi
+
+    TUNNEL_CONTROL_DIR="$(mktemp -d /tmp/fluxvla-ssh.XXXXXX)"
+    TUNNEL_CONTROL_SOCKET="${TUNNEL_CONTROL_DIR}/control"
+
+    SSH_CMD=(
+        ssh
+        -p "$SSH_PORT"
+        -o ExitOnForwardFailure=yes
+        -o ServerAliveInterval=30
+        -o ServerAliveCountMax=3
+    )
+    if [ -n "$SSH_KEY" ]; then
+        SSH_CMD+=(-i "$SSH_KEY")
+    fi
+    SSH_CMD+=(
+        -M
+        -S "$TUNNEL_CONTROL_SOCKET"
+        -fN
+        -L "${LOCAL_PORT}:127.0.0.1:${REMOTE_PORT}"
+        "$SSH_HOST"
+    )
 
     echo "[client] Starting SSH tunnel..."
-    echo "  $SSH_CMD"
-    $SSH_CMD &
-    TUNNEL_PID=$!
-    sleep 2
+    echo "  ${SSH_CMD[*]}"
+    echo "[client] Complete any host-key or password prompts below."
+    "${SSH_CMD[@]}"
 
-    if ! kill -0 "$TUNNEL_PID" 2>/dev/null; then
+    if ! TUNNEL_STATUS=$(ssh -S "$TUNNEL_CONTROL_SOCKET" -O check "$SSH_HOST" 2>&1); then
         echo "[client] ERROR: SSH tunnel failed to start."
+        echo "  $TUNNEL_STATUS"
         exit 1
     fi
-    echo "[client] SSH tunnel running (pid=$TUNNEL_PID)"
+    echo "[client] SSH tunnel running ($TUNNEL_STATUS)"
     echo "  local :${LOCAL_PORT} -> remote :${REMOTE_PORT}"
 fi
 
 echo "[client] Starting inference with config: $CONFIG"
-export FLUXVLA_REMOTE_CLIENT_ONLY=1
-export PYTHONPATH="$(pwd):${PYTHONPATH}"
-python scripts/inference.py --config "$CONFIG" $EXTRA_ARGS
+"$PYTHON_BIN" scripts/inference.py --config "$CONFIG" $EXTRA_ARGS

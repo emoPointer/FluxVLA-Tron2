@@ -12,13 +12,13 @@ excellent work.
 This document describes the recommended workflow for fine-tuning PI0.5 with
 custom Tron2 data and deploying it with remote inference.  It is written for
 the common setup where a GPU workstation/server runs the VLA model, while the
-Tron2 robot computer only collects ROS observations and sends WebSocket control
-commands to the robot.
+Tron2 robot computer consumes TRON2 Bridge WebSocket observations and sends
+WebSocket control commands to the robot.
 
 The current deployment path is:
 
 ```text
-Tron2 ROS topics -> robot-side FluxVLA client -> SSH tunnel -> GPU server ZMQ
+TRON2 Bridge WebSocket -> robot-side FluxVLA client -> SSH tunnel -> GPU server ZMQ
     -> PI0.5 policy inference -> action returned to robot client
     -> Tron2 WebSocket control service
 ```
@@ -48,7 +48,8 @@ measures.
 
 - Tron2 PI0.5 LoRA fine-tuning configuration.
 - LeRobot-style dataset layout and field expectations for Tron2 data.
-- Three-camera ROS observation collection on the Tron2 Power Computing Module.
+- Synchronized three-camera, joint, and gripper observations through the
+  TRON2 Bridge WebSocket on the Power Computing Module.
 - ZMQ-based remote inference with SSH tunnel support.
 - Dry-run mode that completes observation collection, image transfer, server
   inference, and action return without publishing robot actions.
@@ -60,11 +61,11 @@ measures.
 ### Not Included or Not Supported
 
 - PI0.5 base checkpoints must be obtained separately by the user.
-- Robot network access, robot credentials, ROS services, and WebSocket control
-  services must be configured on the user's own Tron2 environment.
+- Robot network access, TRON2 Bridge, and WebSocket control services must be
+  configured on the user's own Tron2 environment.
 - General task planning, motion planning, collision avoidance, certified safety
   control, and unattended production operation are out of scope.
-- Different robot firmware, ROS topic layouts, controller APIs, or camera
+- Different robot firmware, Bridge topic layouts, controller APIs, or camera
   setups may require local configuration or code changes.
 
 ### Repository Layout
@@ -104,7 +105,7 @@ This guide assumes three logical components:
 | Component               | Role                                                     |
 | ----------------------- | -------------------------------------------------------- |
 | GPU server              | Fine-tunes PI0.5 and serves the model through ZMQ        |
-| Power Computing Module  | External Tron2 computer; runs ROS and the FluxVLA client |
+| Power Computing Module  | External Tron2 computer; runs TRON2 Bridge and FluxVLA client |
 | Internal robot computer | Internal controller; not exposed directly to users       |
 
 Tron2 has two computers.  The internal robot computer is inside the robot and
@@ -120,8 +121,14 @@ forward:
 Power Computing Module localhost:5555 -> GPU server 127.0.0.1:3333
 ```
 
-The Tron2 control WebSocket is separate from remote inference.  It is used only
-when actions are executed:
+The observation and control WebSockets are separate from remote inference:
+
+```text
+wss://10.192.1.4/bridge/ws        # aligned images, joints, and grippers
+ws://10.192.1.2:5000              # robot state and MoveJ/ServoJ control
+```
+
+The robot control WebSocket is used only when actions are executed:
 
 ```text
 ws://<TRON2_CONTROLLER_IP>:<TRON2_WS_PORT>
@@ -133,11 +140,11 @@ port is `5000`:
 ```text
 TRON2_CONTROLLER_IP = 10.192.1.2
 TRON2_WS_PORT       = 5000
-TRON2_WS_ACCID      = <YOUR_TRON2_ACCID>
 ```
 
-For a new robot, `robot_ip` usually stays `10.192.1.2`; replace `ws_accid` with
-the account ID of the target robot.
+For a new robot, `robot_ip` usually stays `10.192.1.2`.  The public
+[`tron2_env`](https://github.com/limxdynamics/tron2_env) transport detects the
+controller account ID from server messages, so `ws_accid` must remain `None`.
 
 Important: remote inference requires the Power Computing Module to reach the
 GPU server.  To connect the robot to the public network, either configure Wi-Fi
@@ -280,47 +287,48 @@ task_descriptions={
 The interactive client asks for a task ID.  If the user enters `1`, this
 description is sent to the model.
 
-### ROS topics
+### TRON2 Bridge WebSocket observations
 
-The current config uses:
+The FluxVLA client does not subscribe to ROS. It uses the public
+`tron2_env.BridgeObservationProvider` to receive aligned images, joints, and
+grippers from the Bridge:
 
 ```python
 operator=dict(
-    type='Tron2Operator',
-    img_left_topic='/camera/left/color/image_raw',
-    img_right_topic='/camera/right/color/image_raw',
-    img_top_topic='/camera/top/color/image_raw',
-    joint_state_topic='/joint_states',
-    gripper_state_topic='/gripper_state',
-    ee_pose_left_topic='/left_arm/ee_pose',
-    ee_pose_right_topic='/right_arm/ee_pose',
+    type='Tron2EnvOperator',
+    bridge_host='wss://10.192.1.4',
+    bridge_ws_path='/bridge/ws',
+    bridge_image_topics=dict(
+        camera_left='/camera/left/color/image_resized/compressed',
+        camera_right='/camera/right/color/image_resized/compressed',
+        camera_top='/camera/top/color/image_raw/compressed',
+    ),
+    bridge_joint_topics=dict(
+        joint_states='/joint_states',
+        gripper='/gripper_state',
+    ),
+    bridge_verify_tls=False,
+    robot_ip='10.192.1.2',
+    ws_port=5000,
     ws_accid=None,
+    movej_duration=2.0,
+    servoj_publish_rate=300.0,
+    max_servoj_step_rad=0.2,
+    max_state_source_mismatch_rad=0.5,
+    lock_head=True,
+    max_head_hold_error_rad=0.05,
 )
 ```
 
-On a new robot, first list the available topics:
-
-```bash
-rostopic list
-```
-
-Then check the frequency of the required topics:
-
-```bash
-rostopic hz /camera/left/color/image_raw
-rostopic hz /camera/right/color/image_raw
-rostopic hz /camera/top/color/image_raw
-rostopic hz /joint_states
-rostopic hz /gripper_state
-```
-
-If the camera topics are different, update the config before running
+`bridge_verify_tls=False` is required by this deployment's self-signed Bridge
+certificate and is acceptable only on the isolated, trusted robot LAN. If the
+Bridge publishes different topic paths, update the explicit mappings before
 inference.
 
 ### WebSocket control parameters
 
 The WebSocket controller IP is generally `10.192.1.2`, so it usually does not
-need to be changed.  The robot-specific value is normally `ws_accid`:
+need to be changed:
 
 ```python
 robot_ip='10.192.1.2'
@@ -328,8 +336,12 @@ ws_port=5000
 ws_accid=None
 ```
 
-For a new robot, replace `ws_accid` with the target robot's account ID if the
-controller does not auto-detect it.
+`Tron2EnvOperator` uses the public `tron2_env` runtime, which auto-detects the
+account ID. Do not set `ws_accid` to a non-`None` value. Bridge WebSocket
+observations use `wss://10.192.1.4`; prepare poses use MoveJ and policy actions
+use the separate robot WebSocket with a 300 Hz ServoJ publisher seeded from
+measured joint state. The current PI0.5 LoRA deployment feeds policy waypoints
+at `publish_rate=30` Hz.
 
 ## 5. Fine-Tune PI0.5 with LoRA
 
@@ -435,6 +447,15 @@ The server loads:
 4. the denormalization transform;
 5. `dataset_statistics.json` from the training work directory.
 
+The server reads task metadata from `deployment_metadata.json` beside the
+selected checkpoint when that file exists; otherwise it uses
+`inference.task_descriptions` and `action_layout` from the work directory's
+saved `config.json`. The explicit sidecar is required when a saved training
+config contains a stale example inference prompt. The robot client lists the
+resolved task IDs at startup and rejects unknown IDs. After changing a
+checkpoint or its metadata, restart the server; robot-side code does not need
+task-specific edits.
+
 ## 7. Prepare the Power Computing Module
 
 The Power Computing Module does not need to install the full CUDA training
@@ -458,13 +479,7 @@ Install the Python packages needed by the client:
 
 ```bash
 pip install mmengine pyzmq msgpack numpy safetensors websocket-client
-pip install rospkg catkin_pkg empy defusedxml netifaces
-```
-
-Source ROS before running the client:
-
-```bash
-source /opt/ros/noetic/setup.bash
+pip install "tron2-env[bridge] @ git+https://github.com/limxdynamics/tron2_env.git@5b7b145229416f3731f61657e6fa71c89c37bc9d"
 ```
 
 Do not require `pip install -e .` on the Power Computing Module.  The remote
@@ -477,31 +492,27 @@ PYTHONPATH="$(pwd):${PYTHONPATH}"
 
 This avoids importing the full model/CUDA stack on the robot.
 
-## 8. Verify Robot-Side ROS and WebSocket
+No ROS environment is required by the FluxVLA client. The TRON2 Bridge service
+may use ROS internally, but that is outside the client process.
 
-Check ROS topics:
+## 8. Verify Bridge and Robot-Control WebSockets
 
-```bash
-rostopic hz /camera/left/color/image_raw
-rostopic hz /camera/right/color/image_raw
-rostopic hz /camera/top/color/image_raw
-rostopic hz /joint_states
-rostopic hz /gripper_state
-```
-
-Check the Tron2 WebSocket control service:
+Check that the Bridge TLS endpoint and robot-control TCP port are reachable:
 
 ```bash
-ping -c 3 10.192.1.2
+python -c "import socket; socket.create_connection(('10.192.1.4', 443), timeout=3); print('bridge tcp ok')"
+python -c "import socket; socket.create_connection(('10.192.1.2', 5000), timeout=3); print('control tcp ok')"
 ```
+
+For a read-only end-to-end observation check, explicitly disable the control
+transport:
 
 ```bash
-python -c "import socket; socket.create_connection(('10.192.1.2', 5000), timeout=3); print('tcp port ok')"
+FLUXVLA_REMOTE_CLIENT_ONLY=1 python -c "from fluxvla.engines.operators import Tron2EnvOperator; o=Tron2EnvOperator(connect_websocket=False); x=o.get_observation(); print(x['state'].shape, {k:v.shape for k,v in x['images'].items()}); o.close()"
 ```
 
-If the TCP port is unstable, fix the Tron2 control service before running
-`dry_run=False`.  Remote inference can work without WebSocket in dry-run mode,
-but real action execution cannot.
+This must report an 18-dimensional state and all three images. If the control
+port is unstable, fix it before running `dry_run=False`.
 
 ## 9. Run Remote Inference in Dry Run Mode
 
@@ -516,7 +527,7 @@ For dry-run validation, explicitly override it with
 inference flow but does not execute actions:
 
 ```text
-ROS observations -> SSH tunnel -> GPU inference -> action returned -> print
+Bridge WebSocket observations -> SSH tunnel -> GPU inference -> action returned -> print
 ```
 
 Run this on the Power Computing Module:
@@ -524,7 +535,6 @@ Run this on the Power Computing Module:
 ```bash
 cd ~/FluxVLA
 conda activate fluxvla
-source /opt/ros/noetic/setup.bash
 
 bash scripts/remote_inference_client.sh \
   configs/pi05/pi05_paligemma_tron2_lora_finetune.py \
@@ -538,12 +548,13 @@ bash scripts/remote_inference_client.sh \
 If the server is reachable only through port 22, keep this SSH tunnel mode.
 If SSH key login is configured, the command will not ask for a password.
 
-During dry run, first enter task ID `0` to put the robot into the reset /
-prepare-pose flow, then enter the actual task ID:
+During dry run, the client first prints the task IDs advertised by the active
+checkpoint. Enter task ID `0` to use the prepare-pose flow, then enter one of
+those advertised task IDs:
 
 ```text
-Enter task ID (or press Enter for default): 0
-Enter task ID after reset: 1
+Enter task ID (0 = prepare pose): 0
+Enter task ID after prepare pose: 6
 Number of times to repeat the task: 1
 ```
 
@@ -561,7 +572,7 @@ Expected dry-run output includes a printed action:
 Only run real execution after:
 
 - dry run succeeds;
-- ROS topics are stable;
+- Bridge observations are stable;
 - WebSocket handshake succeeds;
 - a physical emergency stop is available.
 
@@ -608,19 +619,25 @@ During runtime interaction, enter task ID `0` to move the robot to the
 configured prepare pose:
 
 ```text
-Enter task ID (or press Enter for default): 0
-Enter task ID after reset: 1
+Enter task ID (0 = prepare pose): 0
+Enter task ID after prepare pose: 6
 Number of times to repeat the task: 1
 ```
 
 In dry-run mode, prepare-pose execution is skipped.  In real execution mode,
-prepare-pose commands are sent through the Tron2 WebSocket.
+each prepare pose uses MoveJ and does not send a head target. Before the first
+policy action, the full chunk is checked against both Bridge and control
+feedback before a fresh `tron2_env` MotionController may stream ServoJ at
+300 Hz. Policy head trajectories are rejected and the measured head position
+is held. If prepare is requested again, the ServoJ publisher is disconnected
+before any new MoveJ command is sent.
 
 ## 12. Important Safety Notes
 
-`Ctrl+C` stops the local FluxVLA client and closes the SSH tunnel, but it is not
-a robot emergency stop.  It does not automatically disable torque or guarantee
-that a command already sent to the Tron2 controller is canceled.
+`Ctrl+C` runs client cleanup, stops the policy feeder, and disconnects the
+ServoJ publisher and control WebSocket.  It is still not a robot emergency
+stop: it does not disable torque or guarantee that a command already accepted
+by the Tron2 controller is canceled.
 
 For first deployment on a new robot:
 
@@ -628,7 +645,8 @@ For first deployment on a new robot:
 - use `inference.execute_horizon=4`;
 - keep object placement conservative;
 - verify gripper open/close convention before full-speed runs;
-- verify `ws_accid` belongs to the current robot.
+- keep `max_servoj_step_rad=0.2` until recorded trajectories justify a tighter
+  deployment-specific value.
 
 ## 13. Troubleshooting
 
@@ -644,36 +662,19 @@ The script sets `PYTHONPATH` automatically.  Avoid installing the full editable
 package on the Power Computing Module unless the machine has a compatible
 compiler/CUDA environment.
 
-### `ModuleNotFoundError: No module named 'rospy'`
+### `ModuleNotFoundError: No module named 'websockets'`
 
-Source ROS and install Python ROS dependencies inside the conda environment:
-
-```bash
-source /opt/ros/noetic/setup.bash
-pip install rospkg catkin_pkg empy defusedxml netifaces
-```
-
-### Required ROS topics are missing
-
-If `rostopic list` on the Power Computing Module does not show the required
-camera, joint, or gripper topics, start the required robot-side services with
-the `install.sh` script inside the Power Computing Module's `limx-agent`
-directory:
+Install the official Bridge extra in the client environment:
 
 ```bash
-cd /path/to/limx-agent
-bash install.sh
+pip install "tron2-env[bridge] @ git+https://github.com/limxdynamics/tron2_env.git@5b7b145229416f3731f61657e6fa71c89c37bc9d"
 ```
 
-After the services start, run `rostopic list` again and verify the required
-topics before launching FluxVLA.
+### `TRON2 Bridge did not provide one complete ... observation`
 
-### `ImportError: libp11-kit.so.0: undefined symbol: ffi_type_pointer`
-
-This is a Conda/ROS dynamic-library conflict triggered by `cv_bridge`.
-The Tron2 operator now avoids `cv_bridge` for `sensor_msgs/Image` conversion.
-Make sure the Power Computing Module has the latest FluxVLA branch with this
-change.
+Check `wss://10.192.1.4/bridge/ws`, the five configured topic paths, camera
+services, and Bridge logs. The client deliberately fails instead of reusing a
+stale or partial observation.
 
 ### `Cannot reach VLA server at tcp://127.0.0.1:5555`
 
@@ -705,7 +706,7 @@ high-level dev mode.
 
 Check:
 
-- `ws_accid` is correct for the robot;
+- the controller emits an account ID that `tron2_env` can auto-detect;
 - no other official control UI is holding an exclusive connection;
 - the robot is in the correct external-control/API-control mode;
 - the command path matches the robot controller's expected WebSocket API.
@@ -717,6 +718,7 @@ The current Tron2 deployment branch changes these main files:
 ```text
 configs/pi05/pi05_paligemma_tron2_lora_finetune.py
 fluxvla/engines/runners/tron2_inference_runner.py
+fluxvla/engines/operators/tron2_env_operator.py
 fluxvla/engines/operators/tron2_operator.py
 fluxvla/engines/runners/base_inference_runner.py
 fluxvla/transforms/normalize.py
@@ -731,4 +733,8 @@ The most important runtime switches are:
 | `inference.dry_run=False`     | execute returned actions on the robot    |
 | `inference.execute_horizon=4` | execute only the first 4 steps per chunk |
 | `inference.operator.ws_port`  | Tron2 WebSocket controller port          |
-| `inference.operator.ws_accid` | Tron2 WebSocket account/robot identifier |
+| `inference.operator.servoj_publish_rate` | ServoJ background rate (300 Hz) |
+| `inference.operator.max_servoj_step_rad` | Per-waypoint delta guard (rad) |
+| `inference.operator.max_state_source_mismatch_rad` | Bridge/control feedback mismatch guard (rad) |
+| `inference.operator.lock_head` | reject policy head targets and hold measured head |
+| `inference.operator.max_head_hold_error_rad` | block ServoJ if the measured head drifts (rad) |

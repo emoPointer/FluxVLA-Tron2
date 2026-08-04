@@ -14,7 +14,7 @@ import io
 import threading
 import time
 from dataclasses import dataclass
-from typing import Callable
+from typing import Callable, Optional
 
 import numpy as np
 import torch
@@ -191,6 +191,7 @@ def create_server(
     port: int = 5555,
     device: str = 'cuda:0',
     mixed_precision_dtype=torch.bfloat16,
+    deployment_metadata: Optional[dict] = None,
 ) -> PolicyServer:
     """Create a ZMQ server that wraps a VLA model.
 
@@ -203,6 +204,8 @@ def create_server(
         port: Bind port.
         device: CUDA device.
         mixed_precision_dtype: Dtype for autocast.
+        deployment_metadata: Checkpoint-specific task/action metadata exposed
+            read-only to remote clients.
     """
     torch_device = torch.device(device)
     vla.eval()
@@ -277,8 +280,16 @@ def create_server(
             'avg_infer_time': avg,
         }
 
+    def get_deployment_metadata() -> dict:
+        return dict(deployment_metadata or {})
+
     server = PolicyServer(host=host, port=port)
     server.register_endpoint('predict_action', predict_action)
     server.register_endpoint('reset', reset, requires_input=False)
     server.register_endpoint('get_status', get_status, requires_input=False)
+    server.register_endpoint(
+        'get_deployment_metadata',
+        get_deployment_metadata,
+        requires_input=False,
+    )
     return server

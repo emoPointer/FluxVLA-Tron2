@@ -10,13 +10,14 @@
 
 本文档介绍如何使用自定义 Tron2 数据对 PI0.5 进行 LoRA 微调，并通过
 remote inference 在真实 Tron2 上部署策略。常见部署形态是：GPU
-工作站/服务器负责模型训练和推理，Tron2 外挂算力模块负责采集 ROS
-观测、通过 SSH 隧道请求远程推理，并通过 Tron2 WebSocket 控制服务执行动作。
+工作站/服务器负责模型训练和推理，Tron2 外挂算力模块通过 TRON2 Bridge
+WebSocket 获取观测、通过 SSH 隧道请求远程推理，并通过机器人控制 WebSocket
+执行动作。
 
 当前部署链路是：
 
 ```text
-Tron2 ROS topics -> robot-side FluxVLA client -> SSH tunnel -> GPU server ZMQ
+TRON2 Bridge WebSocket -> robot-side FluxVLA client -> SSH tunnel -> GPU server ZMQ
     -> PI0.5 policy inference -> action returned to robot client
     -> Tron2 WebSocket control service
 ```
@@ -42,7 +43,8 @@ Tron2 ROS topics -> robot-side FluxVLA client -> SSH tunnel -> GPU server ZMQ
 
 - Tron2 PI0.5 LoRA 微调配置。
 - 面向 Tron2 数据的 LeRobot 数据结构和字段说明。
-- 在 Tron2 Power Computing Module 上采集三路 ROS 相机观测。
+- 在 Tron2 Power Computing Module 上通过 TRON2 Bridge WebSocket 获取对齐后的
+  三路图像、关节和夹爪观测。
 - 基于 ZMQ 的 remote inference，并支持 SSH tunnel。
 - dry-run 模式：完整执行观测采集、图像传输、服务器推理、动作返回，但不发布
   机器人动作。
@@ -53,11 +55,11 @@ Tron2 ROS topics -> robot-side FluxVLA client -> SSH tunnel -> GPU server ZMQ
 ### 不包含或不支持的内容
 
 - PI0.5 base 权重需要用户自行获取。
-- 机器人网络、机器人账号、ROS 服务和 WebSocket 控制服务需要用户在自己的
-  Tron2 环境中配置。
+- 机器人网络、TRON2 Bridge 和 WebSocket 控制服务需要用户在自己的 Tron2
+  环境中配置。
 - 通用任务规划、运动规划、碰撞规避、认证级安全控制和无人值守生产运行不在本仓库
   范围内。
-- 不同机器人固件、ROS 话题布局、控制器 API 或相机配置可能需要用户自行调整配置
+- 不同机器人固件、Bridge 话题布局、控制器 API 或相机配置可能需要用户自行调整配置
   或代码。
 
 ### 目录结构
@@ -94,7 +96,7 @@ Issue 中披露漏洞细节。
 | 组件                    | 作用                                           |
 | ----------------------- | ---------------------------------------------- |
 | GPU server              | 微调 PI0.5，并通过 ZMQ 提供远程推理服务        |
-| Power Computing Module  | Tron2 外挂算力模块，运行 ROS 和 FluxVLA 客户端 |
+| Power Computing Module  | Tron2 外挂算力模块，运行 TRON2 Bridge 和 FluxVLA 客户端 |
 | Internal robot computer | 机器人内部控制电脑，通常不直接开放给用户       |
 
 Tron2 通常有两台电脑。内部机器人电脑在机器人内部，一般不直接开放给用户。
@@ -108,8 +110,14 @@ Tron2 通常有两台电脑。内部机器人电脑在机器人内部，一般�
 Power Computing Module localhost:5555 -> GPU server 127.0.0.1:3333
 ```
 
-Tron2 控制 WebSocket 与 remote inference 是两条不同链路。WebSocket
-只在真正执行动作时使用：
+观测 WebSocket、控制 WebSocket 与 remote inference 是三条不同链路：
+
+```text
+wss://10.192.1.4/bridge/ws        # 对齐后的图像、关节和夹爪
+ws://10.192.1.2:5000              # 机器人状态及 MoveJ/ServoJ 控制
+```
+
+机器人控制 WebSocket 只在真正执行动作时使用：
 
 ```text
 ws://<TRON2_CONTROLLER_IP>:<TRON2_WS_PORT>
@@ -120,11 +128,11 @@ ws://<TRON2_CONTROLLER_IP>:<TRON2_WS_PORT>
 ```text
 TRON2_CONTROLLER_IP = 10.192.1.2
 TRON2_WS_PORT       = 5000
-TRON2_WS_ACCID      = <YOUR_TRON2_ACCID>
 ```
 
-新机器人一般不需要修改 `robot_ip`，保持 `10.192.1.2` 即可；如控制器
-无法自动识别，则需要设置当前机器人的 `ws_accid`。
+新机器人一般不需要修改 `robot_ip`，保持 `10.192.1.2` 即可。公开的
+[`tron2_env`](https://github.com/limxdynamics/tron2_env) transport 会从服务端
+消息自动识别账号 ID，因此 `ws_accid` 必须保持为 `None`。
 
 重要提醒：remote inference 要求 Power Computing Module 能访问 GPU
 server。机器人连接公网可以在 `10.192.1.2:8080` Web 界面配置 Wi-Fi，
@@ -251,46 +259,44 @@ task_descriptions={
 
 客户端运行时会要求输入 task ID。输入 `1` 时，模型会收到这里对应的任务描述。
 
-### ROS 话题
+### TRON2 Bridge WebSocket 观测
 
-当前配置使用：
+FluxVLA 客户端不再订阅 ROS，而是使用公开的
+`tron2_env.BridgeObservationProvider` 从 Bridge 获取对齐后的图像、关节和夹爪：
 
 ```python
 operator=dict(
-    type='Tron2Operator',
-    img_left_topic='/camera/left/color/image_raw',
-    img_right_topic='/camera/right/color/image_raw',
-    img_top_topic='/camera/top/color/image_raw',
-    joint_state_topic='/joint_states',
-    gripper_state_topic='/gripper_state',
-    ee_pose_left_topic='/left_arm/ee_pose',
-    ee_pose_right_topic='/right_arm/ee_pose',
+    type='Tron2EnvOperator',
+    bridge_host='wss://10.192.1.4',
+    bridge_ws_path='/bridge/ws',
+    bridge_image_topics=dict(
+        camera_left='/camera/left/color/image_resized/compressed',
+        camera_right='/camera/right/color/image_resized/compressed',
+        camera_top='/camera/top/color/image_raw/compressed',
+    ),
+    bridge_joint_topics=dict(
+        joint_states='/joint_states',
+        gripper='/gripper_state',
+    ),
+    bridge_verify_tls=False,
+    robot_ip='10.192.1.2',
+    ws_port=5000,
     ws_accid=None,
+    movej_duration=2.0,
+    servoj_publish_rate=300.0,
+    max_servoj_step_rad=0.2,
+    max_state_source_mismatch_rad=0.5,
+    lock_head=True,
+    max_head_hold_error_rad=0.05,
 )
 ```
 
-在新机器人上，先查看话题：
-
-```bash
-rostopic list
-```
-
-再检查频率：
-
-```bash
-rostopic hz /camera/left/color/image_raw
-rostopic hz /camera/right/color/image_raw
-rostopic hz /camera/top/color/image_raw
-rostopic hz /joint_states
-rostopic hz /gripper_state
-```
-
-如果话题不同，需要先更新配置。
+本部署的 Bridge 使用自签名证书，因此设置了 `bridge_verify_tls=False`；只能在隔离、
+可信的机器人局域网内这样使用。如果 Bridge 的话题路径不同，必须先修改显式映射。
 
 ### WebSocket 控制参数
 
-WebSocket 控制器 IP 一般是 `10.192.1.2`，通常不用改。机器人相关的值主要是
-`ws_accid`：
+WebSocket 控制器 IP 一般是 `10.192.1.2`，通常不用改：
 
 ```python
 robot_ip='10.192.1.2'
@@ -298,7 +304,10 @@ ws_port=5000
 ws_accid=None
 ```
 
-如果控制器无法自动识别 `accid`，请设置当前机器人的账号 ID。
+`Tron2EnvOperator` 使用公开的 `tron2_env` runtime 自动识别账号 ID，不要把
+`ws_accid` 设置为非 `None`。Bridge 观测走 `wss://10.192.1.4`；prepare pose
+使用 MoveJ，策略动作通过独立的机器人 WebSocket 和从实测状态初始化的 300 Hz
+ServoJ 发布器执行。PI0.5 LoRA 以 `publish_rate=30` Hz 喂入策略路点。
 
 ## 5. 使用 LoRA 微调 PI0.5
 
@@ -400,6 +409,13 @@ python -m fluxvla.engines.runners.serving.serve \
 4. 动作反归一化 transform；
 5. 训练 work directory 中的 `dataset_statistics.json`。
 
+如果所选 checkpoint 的 work directory 中存在 `deployment_metadata.json`，服务端
+优先从这个文件读取任务元数据；否则读取已保存 `config.json` 中的
+`inference.task_descriptions` 和 `action_layout`。当训练配置遗留了示例 inference
+prompt 时，必须用这个显式 sidecar 记录真实训练任务。机器人客户端启动时会列出
+解析后的任务 ID，并拒绝未登记的 ID。切换 checkpoint 或修改其元数据后必须重启
+服务端；机器人侧代码不需要针对不同任务修改。
+
 ## 7. 准备 Power Computing Module
 
 Power Computing Module 不需要完整 CUDA 训练栈，只需要运行轻量 remote client。
@@ -422,13 +438,7 @@ conda activate fluxvla
 
 ```bash
 pip install mmengine pyzmq msgpack numpy safetensors websocket-client
-pip install rospkg catkin_pkg empy defusedxml netifaces
-```
-
-运行客户端前 source ROS：
-
-```bash
-source /opt/ros/noetic/setup.bash
+pip install "tron2-env[bridge] @ git+https://github.com/limxdynamics/tron2_env.git@5b7b145229416f3731f61657e6fa71c89c37bc9d"
 ```
 
 Power Computing Module 上不要求执行 `pip install -e .`。客户端脚本会设置：
@@ -440,30 +450,26 @@ PYTHONPATH="$(pwd):${PYTHONPATH}"
 
 这可以避免在机器人侧导入完整模型/CUDA 栈。
 
-## 8. 检查 ROS 与 WebSocket
+FluxVLA 客户端不需要加载 ROS 环境。TRON2 Bridge 服务内部可以使用 ROS，但该
+实现细节不进入 FluxVLA 客户端进程。
 
-检查 ROS 话题频率：
+## 8. 检查 Bridge 与机器人控制 WebSocket
 
-```bash
-rostopic hz /camera/left/color/image_raw
-rostopic hz /camera/right/color/image_raw
-rostopic hz /camera/top/color/image_raw
-rostopic hz /joint_states
-rostopic hz /gripper_state
-```
-
-检查 Tron2 WebSocket 控制服务：
+先检查 Bridge TLS 端口和机器人控制端口：
 
 ```bash
-ping -c 3 10.192.1.2
+python -c "import socket; socket.create_connection(('10.192.1.4', 443), timeout=3); print('bridge tcp ok')"
+python -c "import socket; socket.create_connection(('10.192.1.2', 5000), timeout=3); print('control tcp ok')"
 ```
+
+只读端到端观测检查必须显式关闭控制 transport：
 
 ```bash
-python -c "import socket; socket.create_connection(('10.192.1.2', 5000), timeout=3); print('tcp port ok')"
+FLUXVLA_REMOTE_CLIENT_ONLY=1 python -c "from fluxvla.engines.operators import Tron2EnvOperator; o=Tron2EnvOperator(connect_websocket=False); x=o.get_observation(); print(x['state'].shape, {k:v.shape for k,v in x['images'].items()}); o.close()"
 ```
 
-如果 TCP 端口不稳定，先修复 Tron2 控制服务。dry run 可以不依赖
-WebSocket，但真实动作执行必须依赖它。
+输出必须包含 18 维状态和三路图像。如果控制端口不稳定，必须先修复再运行
+`dry_run=False`。
 
 ## 9. Dry Run
 
@@ -478,7 +484,7 @@ dry_run=False
 机器人动作：
 
 ```text
-ROS observations -> SSH tunnel -> GPU inference -> action returned -> print
+Bridge WebSocket observations -> SSH tunnel -> GPU inference -> action returned -> print
 ```
 
 在 Power Computing Module 上运行：
@@ -486,7 +492,6 @@ ROS observations -> SSH tunnel -> GPU inference -> action returned -> print
 ```bash
 cd ~/FluxVLA
 conda activate fluxvla
-source /opt/ros/noetic/setup.bash
 
 bash scripts/remote_inference_client.sh \
   configs/pi05/pi05_paligemma_tron2_lora_finetune.py \
@@ -500,12 +505,12 @@ bash scripts/remote_inference_client.sh \
 如果服务器只能通过 22 端口访问，保留 SSH tunnel 模式。若已配置 SSH key，
 运行时不会再要求输入密码。
 
-dry run 时先输入 task ID `0`，验证 reset / prepare-pose 交互流程，再输入真实
-任务 ID：
+dry run 启动时会先显示当前权重登记的任务 ID。输入 task ID `0` 验证
+prepare-pose 交互流程，然后输入其中一个已登记的任务 ID：
 
 ```text
-Enter task ID (or press Enter for default): 0
-Enter task ID after reset: 1
+Enter task ID (0 = prepare pose): 0
+Enter task ID after prepare pose: 6
 Number of times to repeat the task: 1
 ```
 
@@ -522,7 +527,7 @@ dry run 不会真正执行 prepare pose，只验证真实执行前的交互流�
 只有在下面条件都满足后，才运行真实执行：
 
 - dry run 成功；
-- ROS 话题稳定；
+- Bridge 观测稳定；
 - WebSocket 连接稳定；
 - 现场有物理急停。
 
@@ -566,18 +571,22 @@ action_chunk=32
 运行交互中输入 task ID `0`，机器人会进入配置好的 prepare pose：
 
 ```text
-Enter task ID (or press Enter for default): 0
-Enter task ID after reset: 1
+Enter task ID (0 = prepare pose): 0
+Enter task ID after prepare pose: 6
 Number of times to repeat the task: 1
 ```
 
-dry run 下不会执行 prepare pose。真实执行模式下，prepare-pose 指令通过
-Tron2 WebSocket 发送。
+dry run 下不会执行 prepare pose。真实执行模式下，每个 prepare pose 使用 MoveJ，
+且不发送头部目标。第一次策略动作前，会先用 Bridge 与控制 WebSocket 的反馈校验
+整个动作段，校验通过后才允许新建 `tron2_env` MotionController 并以 300 Hz
+发布 ServoJ。策略头部轨迹会被拒绝，控制器只保持启动时的实测头部位置；再次请求
+prepare 时，会先断开 ServoJ 发布器，之后才发送新的 MoveJ。
 
 ## 12. 安全提醒
 
-`Ctrl+C` 只会停止本地 FluxVLA client 并关闭 SSH tunnel，不是机器人急停。
-它不会自动卸力，也不能保证已经发送给 Tron2 控制器的指令被取消。
+`Ctrl+C` 会执行客户端清理，停止策略 feeder，并断开 ServoJ 发布器和控制
+WebSocket，但它仍然不是机器人急停：不会自动卸力，也不能保证控制器已经接受
+的指令被取消。
 
 新机器人首次部署时：
 
@@ -585,7 +594,7 @@ Tron2 WebSocket 发送。
 - 使用 `inference.execute_horizon=4`；
 - 物体摆放保守；
 - 完整运行前先确认夹爪开合约定；
-- 确认 `ws_accid` 属于当前机器人。
+- 在有实测轨迹支持更严格阈值前，保持 `max_servoj_step_rad=0.2`。
 
 ## 13. 常见问题
 
@@ -600,32 +609,18 @@ bash scripts/remote_inference_client.sh ...
 脚本会自动设置 `PYTHONPATH`。除非机器具备兼容的编译器/CUDA 环境，否则
 Power Computing Module 上不建议安装完整 editable package。
 
-### `ModuleNotFoundError: No module named 'rospy'`
+### `ModuleNotFoundError: No module named 'websockets'`
 
-在 conda 环境中 source ROS 并安装 ROS Python 依赖：
-
-```bash
-source /opt/ros/noetic/setup.bash
-pip install rospkg catkin_pkg empy defusedxml netifaces
-```
-
-### 缺少必要 ROS 话题
-
-如果 Power Computing Module 上执行 `rostopic list` 后缺少必要相机、关节或
-夹爪话题，请进入算力模块内部的 `limx-agent` 目录并执行：
+在客户端轻量环境中安装官方 Bridge extra：
 
 ```bash
-cd /path/to/limx-agent
-bash install.sh
+pip install "tron2-env[bridge] @ git+https://github.com/limxdynamics/tron2_env.git@5b7b145229416f3731f61657e6fa71c89c37bc9d"
 ```
 
-服务启动后重新执行 `rostopic list` 并检查话题。
+### `TRON2 Bridge did not provide one complete ... observation`
 
-### `ImportError: libp11-kit.so.0: undefined symbol: ffi_type_pointer`
-
-这是 Conda/ROS 动态库冲突，通常由 `cv_bridge` 触发。当前 Tron2 operator
-已经避免使用 `cv_bridge` 转换 `sensor_msgs/Image`。请确认 Power Computing
-Module 使用了包含该改动的 FluxVLA 分支。
+检查 `wss://10.192.1.4/bridge/ws`、配置中的五条话题路径、相机服务和 Bridge
+日志。客户端会直接失败，不会复用过期或不完整的观测。
 
 ### `Cannot reach VLA server at tcp://127.0.0.1:5555`
 
@@ -655,7 +650,7 @@ python -c "import socket; socket.create_connection(('10.192.1.2', 5000), timeout
 
 检查：
 
-- `ws_accid` 是否属于当前机器人；
+- 控制器是否发送可被 `tron2_env` 自动识别的账号 ID；
 - 是否有官方控制 UI 占用了独占连接；
 - 机器人是否处于正确的外部/API 控制模式；
 - WebSocket 指令路径是否匹配控制器 API。
@@ -667,6 +662,7 @@ python -c "import socket; socket.create_connection(('10.192.1.2', 5000), timeout
 ```text
 configs/pi05/pi05_paligemma_tron2_lora_finetune.py
 fluxvla/engines/runners/tron2_inference_runner.py
+fluxvla/engines/operators/tron2_env_operator.py
 fluxvla/engines/operators/tron2_operator.py
 fluxvla/engines/runners/base_inference_runner.py
 fluxvla/transforms/normalize.py
@@ -681,4 +677,8 @@ scripts/remote_inference_client.sh
 | `inference.dry_run=False`     | 在机器人上执行返回动作           |
 | `inference.execute_horizon=4` | 每个 chunk 只执行前 4 步         |
 | `inference.operator.ws_port`  | Tron2 WebSocket 控制端口         |
-| `inference.operator.ws_accid` | Tron2 WebSocket 账号/机器人标识  |
+| `inference.operator.servoj_publish_rate` | ServoJ 后台发布频率（300 Hz） |
+| `inference.operator.max_servoj_step_rad` | 相邻路点变化上限（rad） |
+| `inference.operator.max_state_source_mismatch_rad` | Bridge/控制反馈差异上限（rad） |
+| `inference.operator.lock_head` | 拒绝策略头部目标并保持实测头部位置 |
+| `inference.operator.max_head_hold_error_rad` | 实测头部漂移时阻止 ServoJ（rad） |
