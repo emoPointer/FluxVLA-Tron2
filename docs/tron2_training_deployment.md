@@ -234,7 +234,7 @@ operator=dict(
     movej_duration=2.0,
     servoj_publish_rate=300.0,
     max_servoj_step_rad=0.2,
-    max_state_source_mismatch_rad=0.5,
+    max_state_source_mismatch_rad=None,
     lock_head=True,
     max_head_hold_error_rad=0.05,
 )
@@ -646,6 +646,6 @@ The most important runtime switches are:
 | `inference.operator.ws_port`  | Tron2 WebSocket controller port          |
 | `inference.operator.servoj_publish_rate` | ServoJ background rate (300 Hz) |
 | `inference.operator.max_servoj_step_rad` | Per-waypoint delta guard (rad) |
-| `inference.operator.max_state_source_mismatch_rad` | Bridge/control feedback mismatch guard (rad) |
+| `inference.operator.max_state_source_mismatch_rad=None` | disable duplicate Bridge/control mismatch blocking |
 | `inference.operator.lock_head` | reject policy head targets and hold measured head |
 | `inference.operator.max_head_hold_error_rad` | block ServoJ if the measured head drifts (rad) |

@@ -285,7 +285,7 @@ operator=dict(
     movej_duration=2.0,
     servoj_publish_rate=300.0,
     max_servoj_step_rad=0.2,
-    max_state_source_mismatch_rad=0.5,
+    max_state_source_mismatch_rad=None,
     lock_head=True,
     max_head_hold_error_rad=0.05,
 )
@@ -679,6 +679,6 @@ scripts/remote_inference_client.sh
 | `inference.operator.ws_port`  | Tron2 WebSocket 控制端口         |
 | `inference.operator.servoj_publish_rate` | ServoJ 后台发布频率（300 Hz） |
 | `inference.operator.max_servoj_step_rad` | 相邻路点变化上限（rad） |
-| `inference.operator.max_state_source_mismatch_rad` | Bridge/控制反馈差异上限（rad） |
+| `inference.operator.max_state_source_mismatch_rad=None` | 关闭重复的 Bridge/控制反馈差异阻断 |
 | `inference.operator.lock_head` | 拒绝策略头部目标并保持实测头部位置 |
 | `inference.operator.max_head_hold_error_rad` | 实测头部漂移时阻止 ServoJ（rad） |

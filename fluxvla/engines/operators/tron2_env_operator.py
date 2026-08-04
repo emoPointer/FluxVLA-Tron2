@@ -111,7 +111,7 @@ class Tron2EnvOperator:
                  movej_tolerance: float = 0.05,
                  movej_timeout: float = 10.0,
                  max_servoj_step_rad: Optional[float] = 0.2,
-                 max_state_source_mismatch_rad: Optional[float] = 0.5,
+                 max_state_source_mismatch_rad: Optional[float] = None,
                  lock_head: bool = True,
                  max_head_hold_error_rad: float = 0.05,
                  servoj_joint_lower_limits: Optional[List[float]] = None,
@@ -248,8 +248,10 @@ class Tron2EnvOperator:
             raise ValueError(f'{name} must contain exactly '
                              f'{sorted(expected_keys)}; got '
                              f'{sorted(topics)}.')
-        invalid = [key for key, topic in topics.items()
-                   if not isinstance(topic, str) or not topic.startswith('/')]
+        invalid = [
+            key for key, topic in topics.items()
+            if not isinstance(topic, str) or not topic.startswith('/')
+        ]
         if invalid:
             raise ValueError(f'{name} contains invalid Bridge topic paths for '
                              f'keys {invalid}.')
@@ -324,8 +326,7 @@ class Tron2EnvOperator:
         provider = self._create_bridge_provider()
         provider.start()
         try:
-            observation = provider.get_obs(
-                timeout=self.bridge_startup_timeout)
+            observation = provider.get_obs(timeout=self.bridge_startup_timeout)
             self._pending_bridge_observation = (
                 self._validate_bridge_observation(observation))
         except Exception as exc:
@@ -497,8 +498,9 @@ class Tron2EnvOperator:
                                                      'right_gripper')
         if head is not None:
             if self.lock_head:
-                raise ValueError('Head movement is locked for this deployment; '
-                                 'MoveJ prepare poses must not include head.')
+                raise ValueError(
+                    'Head movement is locked for this deployment; '
+                    'MoveJ prepare poses must not include head.')
             head = np.asarray(head, dtype=np.float64)
             if head.shape != (self._HEAD_DIM, ) or not np.all(
                     np.isfinite(head)):
@@ -555,10 +557,12 @@ class Tron2EnvOperator:
             raise ValueError(f'{name} contains non-finite values.')
         return array
 
-    def _prepare_servoj_trajectory(self, left_arm_trajectory,
+    def _prepare_servoj_trajectory(self,
+                                   left_arm_trajectory,
                                    right_arm_trajectory,
                                    left_gripper_trajectory,
-                                   right_gripper_trajectory, head_trajectory,
+                                   right_gripper_trajectory,
+                                   head_trajectory,
                                    current_state,
                                    check_state_source: bool = True):
         left = self._as_trajectory(left_arm_trajectory, 'left arm trajectory',
@@ -592,8 +596,8 @@ class Tron2EnvOperator:
         current = np.asarray(current_state, dtype=np.float64)
         if current.shape != (self._STATE_DIM, ) or not np.all(
                 np.isfinite(current)):
-            raise RuntimeError('tron2_env must provide one finite 18-dim '
-                               f'state; got {current.shape}.')
+            raise ValueError('tron2_env must provide one finite 18-dim '
+                             f'state; got {current.shape}.')
         current_servoj = np.concatenate(
             [current[:7], current[8:15], current[16:18]])
 
@@ -610,9 +614,8 @@ class Tron2EnvOperator:
                 raise RuntimeError('Latest Bridge state is invalid for ServoJ '
                                    'cross-validation: '
                                    f'{bridge_state.shape}.')
-            bridge_servoj = np.concatenate([
-                bridge_state[:7], bridge_state[8:15], bridge_state[16:18]
-            ])
+            bridge_servoj = np.concatenate(
+                [bridge_state[:7], bridge_state[8:15], bridge_state[16:18]])
             source_deltas = np.abs(current_servoj - bridge_servoj)
             source_joint = int(np.argmax(source_deltas))
             source_delta = float(source_deltas[source_joint])
@@ -626,14 +629,15 @@ class Tron2EnvOperator:
 
         if self.lock_head:
             if head_trajectory is not None:
-                raise ValueError('Head movement is locked for this deployment; '
-                                 'policy head trajectories are not allowed.')
+                raise ValueError(
+                    'Head movement is locked for this deployment; '
+                    'policy head trajectories are not allowed.')
             if self._head_hold_position is None:
                 # Lock exactly to the robot-control feedback used to seed the
                 # first ServoJ publisher. Bridge feedback is independently
                 # checked above, but is not used as a corrective head target.
-                self._head_hold_position = current_servoj[
-                    -self._HEAD_DIM:].copy()
+                self._head_hold_position = current_servoj[-self.
+                                                          _HEAD_DIM:].copy()
             head_error = np.abs(current_servoj[-self._HEAD_DIM:] -
                                 self._head_hold_position)
             head_joint = int(np.argmax(head_error))
@@ -670,8 +674,7 @@ class Tron2EnvOperator:
             max_delta = float(deltas[max_index])
             if max_delta > self.max_servoj_step_rad:
                 current_value = float(points[max_index[0], max_index[1]])
-                target_value = float(points[max_index[0] + 1,
-                                            max_index[1]])
+                target_value = float(points[max_index[0] + 1, max_index[1]])
                 raise ValueError(
                     'ServoJ waypoint delta exceeds safety limit: '
                     f'{max_delta:.6f} rad at transition {max_index[0]}, '
@@ -726,9 +729,13 @@ class Tron2EnvOperator:
                     state = transport.get_joint_state(
                         timeout=self.state_timeout)['states']
                     self._prepare_servoj_trajectory(
-                        left_arm_trajectory, right_arm_trajectory,
-                        left_gripper_trajectory, right_gripper_trajectory,
-                        head_trajectory, state, check_state_source=True)
+                        left_arm_trajectory,
+                        right_arm_trajectory,
+                        left_gripper_trajectory,
+                        right_gripper_trajectory,
+                        head_trajectory,
+                        state,
+                        check_state_source=True)
                     controller = self._start_motion_controller_locked(dt)
 
                 # On first startup, cross-check Bridge and control feedback
@@ -739,14 +746,14 @@ class Tron2EnvOperator:
                 state = controller.get_joint_states(
                     timeout=self.state_timeout)['states']
                 waypoints, left_gripper, right_gripper = (
-                    self._prepare_servoj_trajectory(left_arm_trajectory,
-                                                    right_arm_trajectory,
-                                                    left_gripper_trajectory,
-                                                    right_gripper_trajectory,
-                                                    head_trajectory,
-                                                    state,
-                                                    check_state_source=(
-                                                        starting_controller)))
+                    self._prepare_servoj_trajectory(
+                        left_arm_trajectory,
+                        right_arm_trajectory,
+                        left_gripper_trajectory,
+                        right_gripper_trajectory,
+                        head_trajectory,
+                        state,
+                        check_state_source=(starting_controller)))
 
             start = time.perf_counter()
             for index, waypoint in enumerate(waypoints):
@@ -767,6 +774,13 @@ class Tron2EnvOperator:
                 remaining = deadline - time.perf_counter()
                 if remaining > 0:
                     stop_event.wait(remaining)
+        except ValueError as exc:
+            # A rejected trajectory is recoverable. If MotionController has
+            # already started, issuing no replacement command keeps its last
+            # accepted ServoJ target unchanged for the next inference cycle.
+            self._trajectory_error = exc
+            stop_event.set()
+            raise
         except Exception as exc:
             self._trajectory_error = exc
             stop_event.set()

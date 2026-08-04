@@ -97,7 +97,7 @@ def make_operator(transports):
     operator.movej_tolerance = 0.05
     operator.movej_timeout = 10.0
     operator.max_servoj_step_rad = 0.2
-    operator.max_state_source_mismatch_rad = 0.5
+    operator.max_state_source_mismatch_rad = None
     operator.lock_head = True
     operator.max_head_hold_error_rad = 0.05
     operator.servoj_joint_lower_limits = None
@@ -177,24 +177,19 @@ def test_operator_uses_bridge_without_ros(monkeypatch):
     [
         ('tron2_16', np.arange(16, dtype=np.float32)),
         ('tron2_18',
-         np.array([
-             0, 1, 2, 3, 4, 5, 6, 8, 9, 10, 11, 12, 13, 14, 16, 17, 7,
-             15
-         ],
-                  dtype=np.float32)),
+         np.array(
+             [0, 1, 2, 3, 4, 5, 6, 8, 9, 10, 11, 12, 13, 14, 16, 17, 7, 15],
+             dtype=np.float32)),
     ],
 )
 def test_runner_maps_bridge_state_to_training_layout(layout, expected):
     runner = Tron2InferenceRunner.__new__(Tron2InferenceRunner)
     runner.action_layout = layout
-    runner.camera_names = [
-        'cam_high', 'cam_left_wrist', 'cam_right_wrist'
-    ]
+    runner.camera_names = ['cam_high', 'cam_left_wrist', 'cam_right_wrist']
     runner.observation_window = None
     runner.ros_operator = type(
-        'FakeObservationOperator', (), {
-            'get_observation': lambda self: make_bridge_observation()
-        })()
+        'FakeObservationOperator', (),
+        {'get_observation': lambda self: make_bridge_observation()})()
     runner._apply_jpeg_compression = lambda image: image
 
     observation = runner.update_observation_window()
@@ -300,7 +295,7 @@ def test_invalid_first_chunk_never_starts_servoj_publisher():
         )
 
     assert operator._motion_controller is None
-    assert transport.disconnected is True
+    assert transport.disconnected is False
 
 
 def test_head_is_locked_and_policy_head_commands_are_rejected():
@@ -330,20 +325,53 @@ def test_head_is_locked_and_policy_head_commands_are_rejected():
         )
 
 
-def test_bridge_control_state_mismatch_blocks_servoj():
+def test_bridge_control_state_mismatch_check_is_disabled():
     operator = make_operator([])
     control_state = np.zeros(18, dtype=np.float64)
     control_state[3] = 0.51
+    left = np.zeros((1, 7), dtype=np.float64)
+    left[0, 3] = 0.51
 
-    with pytest.raises(ValueError, match='state mismatch blocks ServoJ'):
-        operator._prepare_servoj_trajectory(
-            np.zeros((1, 7)),
-            np.zeros((1, 7)),
+    waypoints, _, _ = operator._prepare_servoj_trajectory(
+        left,
+        np.zeros((1, 7)),
+        np.zeros(1),
+        np.zeros(1),
+        None,
+        control_state,
+    )
+
+    assert waypoints[0, 3] == pytest.approx(0.51)
+
+
+def test_rejected_active_trajectory_keeps_last_servoj_target():
+    transport = FakeTransport()
+    operator = make_operator([transport])
+    trajectory = np.zeros((1, 7))
+
+    operator.execute_trajectory(
+        trajectory,
+        trajectory,
+        np.zeros(1),
+        np.zeros(1),
+        dt=0.001,
+    )
+    controller = operator._motion_controller
+    bad_left = trajectory.copy()
+    bad_left[0, 3] = 1.0
+
+    with pytest.raises(ValueError, match='delta exceeds safety limit'):
+        operator.execute_trajectory(
+            bad_left,
+            trajectory,
             np.zeros(1),
             np.zeros(1),
-            None,
-            control_state,
+            dt=0.001,
         )
+
+    assert operator._motion_controller is controller
+    assert transport.disconnected is False
+    assert len(controller.commands) == 1
 
 
 def test_active_servoj_ignores_expected_stale_bridge_feedback():

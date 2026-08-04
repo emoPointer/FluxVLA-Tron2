@@ -639,3 +639,23 @@ commands and results that were actually executed.
     values `startup_mismatch_limit=0.5` and `waypoint_limit=0.2`;
   - local and PCM SHA-256 digests matched for both synchronized files.
 - No client, WebSocket control session, or robot action was started.
+
+## 2026-08-04 20:50 CST — Port relaxed ServoJ rejection handling to no-RTC client
+
+- Objective: retain only the requested policy-action guards on the no-RTC
+  `Tron2InferenceRunner` baseline: 0.2-rad adjacent ServoJ target delta, head
+  lock/drift check, and shape/finite/gripper data-integrity validation.
+- Changes:
+  - disabled the duplicate Bridge/control feedback mismatch block by setting
+    `max_state_source_mismatch_rad=None` in the operator default and all TRON2
+    configs;
+  - classify an invalid live 18-D state as a recoverable action-validation
+    `ValueError`;
+  - a rejected trajectory no longer disconnects an already active
+    MotionController. No replacement command is issued, so the last accepted
+    ServoJ target remains active; connection/protocol/controller faults still
+    disconnect and propagate.
+- Focused hardware-free tests cover the disabled source comparison, retained
+  delta/head/data checks, first-chunk rejection without starting ServoJ, and
+  active-controller target preservation. No robot process or action was
+  started for this change.

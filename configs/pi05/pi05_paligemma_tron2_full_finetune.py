@@ -266,7 +266,7 @@ inference = dict(
         ws_port=5000,
         servoj_publish_rate=300.0,
         max_servoj_step_rad=0.2,
-        max_state_source_mismatch_rad=0.5,
+        max_state_source_mismatch_rad=None,
         lock_head=True,
         max_head_hold_error_rad=0.05,
     ))

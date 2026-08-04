@@ -60,17 +60,15 @@ def test_tron2_lora_config_deployment_defaults():
     assert operator['movej_duration'] == 2.0
     assert operator['servoj_publish_rate'] == 300.0
     assert operator['max_servoj_step_rad'] == 0.2
-    assert operator['max_state_source_mismatch_rad'] == 0.5
+    assert operator['max_state_source_mismatch_rad'] is None
     assert operator['lock_head'] is True
     assert operator['max_head_hold_error_rad'] == 0.05
 
 
 def test_all_tron2_configs_use_tron2_env_operator():
     config_paths = [
-        ROOT / 'configs' / 'pi05' /
-        'pi05_paligemma_tron2_full_finetune.py',
-        ROOT / 'configs' / 'pi05' /
-        'pi05_paligemma_tron2_lora_finetune.py',
+        ROOT / 'configs' / 'pi05' / 'pi05_paligemma_tron2_full_finetune.py',
+        ROOT / 'configs' / 'pi05' / 'pi05_paligemma_tron2_lora_finetune.py',
         ROOT / 'configs' / 'gr00t' /
         'gr00t_eagle_3b_tron2_3cam_full_finetune.py',
     ]
@@ -83,6 +81,7 @@ def test_all_tron2_configs_use_tron2_env_operator():
         assert 'joint_state_topic' not in operator
         assert operator['servoj_publish_rate'] == 300.0
         assert operator['max_servoj_step_rad'] == 0.2
+        assert operator['max_state_source_mismatch_rad'] is None
         assert operator['lock_head'] is True
 
 
@@ -181,8 +180,8 @@ def test_tron2_checkpoint_metadata_never_falls_back_to_robot_config(tmp_path):
         }
     })
 
-    with pytest.raises(FileNotFoundError,
-                       match='checkpoint-local task metadata'):
+    with pytest.raises(
+            FileNotFoundError, match='checkpoint-local task metadata'):
         load_deployment_metadata(cfg, str(checkpoint))
 
 
