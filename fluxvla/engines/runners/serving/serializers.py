@@ -162,9 +162,13 @@ def encode_predict_request(
     unnorm_key: str,
     fmt: Literal['msgpack', 'protobuf'] = 'msgpack',
     compress: bool = True,
+    rtc: dict | None = None,
 ) -> bytes:
     """Encode a predict_action request."""
     if fmt == 'protobuf':
+        if rtc is not None:
+            raise ValueError(
+                'Remote RTC requests currently require msgpack serialization.')
         from .proto import vla_service_pb2 as pb
 
         req = pb.PredictActionRequest()
@@ -174,12 +178,15 @@ def encode_predict_request(
         return bytes([FORMAT_PROTOBUF]) + req.SerializeToString()
 
     payload = ObsSerializer.to_bytes(obs, compress=compress)
-    return msgpack.packb({
+    data = {
+        'obs_data': payload,
+        'unnorm_key': unnorm_key,
+    }
+    if rtc is not None:
+        data['rtc'] = rtc
+    return MsgSerializer.to_bytes({
         'endpoint': 'predict_action',
-        'data': {
-            'obs_data': payload,
-            'unnorm_key': unnorm_key
-        },
+        'data': data,
     })
 
 

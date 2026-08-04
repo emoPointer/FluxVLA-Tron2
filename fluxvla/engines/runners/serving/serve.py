@@ -49,6 +49,7 @@ def load_deployment_metadata(cfg, ckpt_path: str) -> dict:
     is_tron2 = runtime_inference.get('type') in {
         'Tron2InferenceRunner',
         'Tron2OverlapInferenceRunner',
+        'Tron2RemoteRTCInferenceRunner',
         'Tron2RTCInferenceRunner',
     }
     checkpoint_work_dir = Path(ckpt_path).resolve().parent.parent

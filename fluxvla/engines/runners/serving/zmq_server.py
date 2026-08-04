@@ -31,6 +31,104 @@ def serialize_actions(actions: torch.Tensor) -> bytes:
     return buf.getvalue()
 
 
+def prepare_remote_rtc_inputs(rtc: Optional[dict],
+                              reference: torch.Tensor,
+                              max_action_steps: int,
+                              expected_action_dim: int = None) -> dict:
+    """Validate a stateless remote-RTC payload and create model inputs."""
+    if rtc is None:
+        return {}
+    if not isinstance(rtc, dict):
+        raise ValueError('Remote RTC payload must be a mapping.')
+    unknown = set(rtc) - {'prev_actions', 'prefix_len', 'config'}
+    if unknown:
+        raise ValueError(f'Unknown remote RTC fields: {sorted(unknown)}.')
+
+    prev_actions = np.asarray(rtc.get('prev_actions'))
+    if (prev_actions.ndim != 2 or prev_actions.shape[0] == 0
+            or prev_actions.shape[1] == 0):
+        raise ValueError('Remote RTC prev_actions must have shape [T, D] with '
+                         f'non-zero dimensions; got {prev_actions.shape}.')
+    if prev_actions.shape[0] > max_action_steps:
+        raise ValueError('Remote RTC prev_actions exceeds the model action '
+                         f'horizon: {prev_actions.shape[0]} > '
+                         f'{max_action_steps}.')
+    if (expected_action_dim is not None
+            and prev_actions.shape[1] != expected_action_dim):
+        raise ValueError('Remote RTC prev_actions action dimension does not '
+                         f'match the model: {prev_actions.shape[1]} != '
+                         f'{expected_action_dim}.')
+    if not np.issubdtype(prev_actions.dtype, np.floating):
+        raise ValueError('Remote RTC prev_actions must use a floating dtype; '
+                         f'got {prev_actions.dtype}.')
+    if not np.all(np.isfinite(prev_actions)):
+        raise ValueError('Remote RTC prev_actions contains non-finite values.')
+
+    prefix_len = rtc.get('prefix_len')
+    if isinstance(prefix_len, bool) or not isinstance(prefix_len, int):
+        raise ValueError('Remote RTC prefix_len must be an integer.')
+    if not 0 < prefix_len <= prev_actions.shape[0]:
+        raise ValueError('Remote RTC prefix_len must satisfy '
+                         f'0 < prefix_len <= {prev_actions.shape[0]}; got '
+                         f'{prefix_len}.')
+
+    config = rtc.get('config')
+    if not isinstance(config, dict):
+        raise ValueError('Remote RTC config must be a mapping.')
+    allowed_config = {
+        'enabled', 'method', 'decay_end', 'schedule', 'max_guidance_weight',
+        'use_vjp'
+    }
+    unknown_config = set(config) - allowed_config
+    if unknown_config:
+        raise ValueError('Unknown remote RTC config fields: '
+                         f'{sorted(unknown_config)}.')
+    if config.get('enabled') is not True:
+        raise ValueError('Remote RTC config.enabled must be true.')
+    method = config.get('method')
+    if method not in {'prefix', 'guidance'}:
+        raise ValueError("Remote RTC method must be 'prefix' or 'guidance'; "
+                         f'got {method!r}.')
+
+    model_config = {'method': method}
+    if method == 'guidance':
+        decay_end = config.get('decay_end')
+        if (isinstance(decay_end, bool) or not isinstance(decay_end, int)
+                or not prefix_len <= decay_end <= max_action_steps):
+            raise ValueError('Remote RTC guidance decay_end must satisfy '
+                             f'{prefix_len} <= decay_end <= '
+                             f'{max_action_steps}; got {decay_end!r}.')
+        schedule = config.get('schedule')
+        if schedule not in {'exp', 'linear', 'ones', 'zeros'}:
+            raise ValueError('Remote RTC guidance schedule must be one of '
+                             f"exp/linear/ones/zeros; got {schedule!r}.")
+        max_guidance_weight = config.get('max_guidance_weight')
+        if (isinstance(max_guidance_weight, bool)
+                or not isinstance(max_guidance_weight, (int, float))
+                or not np.isfinite(max_guidance_weight)
+                or not 0.0 < max_guidance_weight <= 100.0):
+            raise ValueError('Remote RTC max_guidance_weight must be finite '
+                             f'and within (0, 100]; got '
+                             f'{max_guidance_weight!r}.')
+        use_vjp = config.get('use_vjp')
+        if not isinstance(use_vjp, bool):
+            raise ValueError('Remote RTC use_vjp must be boolean.')
+        model_config.update({
+            'decay_end': decay_end,
+            'schedule': schedule,
+            'max_guidance_weight': float(max_guidance_weight),
+            'use_vjp': use_vjp,
+        })
+
+    previous_action_tensor = torch.from_numpy(prev_actions.copy())[None].to(
+        device=reference.device, dtype=reference.dtype)
+    return {
+        'prev_actions': previous_action_tensor,
+        'prefix_len': prefix_len,
+        'rtc_config': model_config,
+    }
+
+
 @dataclass
 class EndpointHandler:
     handler: Callable
@@ -218,6 +316,7 @@ def create_server(
 
     def predict_action(obs_data: bytes = None,
                        unnorm_key: str = '',
+                       rtc: dict = None,
                        _obs_dict: dict = None,
                        _wire_format: int = 0) -> dict:
         nonlocal total_requests, total_infer_time
@@ -235,12 +334,44 @@ def create_server(
 
         t0 = time.perf_counter()
         with torch.no_grad(), torch.autocast(
-                'cuda', dtype=mixed_precision_dtype, enabled=True):
+                torch_device.type,
+                dtype=mixed_precision_dtype,
+                enabled=torch_device.type == 'cuda'):
             for k, v in batch.items():
                 if isinstance(v, torch.Tensor):
                     batch[k] = v.to(torch_device)
+            if rtc is not None:
+                reference = batch.get('states')
+                if not isinstance(reference, torch.Tensor):
+                    reference = next((value for value in batch.values()
+                                      if isinstance(value, torch.Tensor)),
+                                     None)
+                if reference is None:
+                    raise ValueError('Remote RTC requires at least one tensor '
+                                     'model input to determine device/dtype.')
+                max_action_steps = int(getattr(vla, 'n_action_steps', 0))
+                if max_action_steps <= 0:
+                    raise ValueError('Remote RTC requires the model to expose '
+                                     'a positive n_action_steps value.')
+                expected_action_dim = getattr(vla, 'ori_action_dim', None)
+                if expected_action_dim is not None:
+                    expected_action_dim = int(expected_action_dim)
+                batch.update(
+                    prepare_remote_rtc_inputs(rtc, reference, max_action_steps,
+                                              expected_action_dim))
             actions = vla.predict_action(**batch)
         infer_time = time.perf_counter() - t0
+
+        raw_action_dim = getattr(vla, 'ori_action_dim', None)
+        if raw_action_dim is None:
+            raw_action_dim = actions.shape[-1]
+        raw_action_dim = int(raw_action_dim)
+        if not 0 < raw_action_dim <= actions.shape[-1]:
+            raise ValueError('Model ori_action_dim is incompatible with its '
+                             f'output: {raw_action_dim} vs '
+                             f'{actions.shape[-1]}.')
+        raw_action_bytes = serialize_actions(
+            actions[..., :raw_action_dim].detach().float())
 
         if denormalize_action is not None:
             actions_np = actions.cpu().numpy()
@@ -264,7 +395,11 @@ def create_server(
                 f'avg_infer={avg*1000:.1f}ms',
                 flush=True)
 
-        return {'action_data': action_bytes, 'infer_time': infer_time}
+        return {
+            'action_data': action_bytes,
+            'raw_action_data': raw_action_bytes,
+            'infer_time': infer_time,
+        }
 
     def reset() -> dict:
         return {'status': 'ok'}
@@ -281,7 +416,13 @@ def create_server(
         }
 
     def get_deployment_metadata() -> dict:
-        return dict(deployment_metadata or {})
+        metadata = dict(deployment_metadata or {})
+        metadata['remote_rtc'] = {
+            'wire_format': 'msgpack',
+            'methods': ['guidance', 'prefix'],
+            'returns_raw_actions': True,
+        }
+        return metadata
 
     server = PolicyServer(host=host, port=port)
     server.register_endpoint('predict_action', predict_action)

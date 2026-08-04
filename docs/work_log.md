@@ -748,3 +748,79 @@ commands and results that were actually executed.
   for the exact head semantics of the 16-D `request_servoj` command, or an
   arms-only ServoJ path must be used if supported. No code/configuration was
   changed and no command-based reproduction was attempted during diagnosis.
+
+## 2026-08-04 17:29 CST — Add stateless GPU-side guidance RTC for the TRON2 remote client
+
+- Baseline checkpoint: before starting this change, committed the existing
+  WebSocket/ServoJ/overlap implementation as
+  `abe72ad Add latency-aligned Tron2 overlap execution`. The untracked user
+  file `command.md` was excluded. No push was performed.
+- Objective: use FluxVLA's original inference-time guidance logic without
+  installing or running Torch/model code on the robot PCM, while continuing to
+  execute a bounded old-action reserve during GPU inference.
+- Server implementation:
+  - extended the msgpack prediction request with an optional stateless `rtc`
+    payload containing the exact normalized old-action remainder, a prefix
+    length, and validated guidance parameters;
+  - validates fields, shape, action horizon/dimension, dtype, finite values,
+    prefix range, decay range, schedule, guidance weight, and VJP type before
+    creating a tensor on the model input device/dtype;
+  - passes `prev_actions`, `prefix_len`, and `rtc_config` into the existing
+    PI0/PI0.5 flow-matching guidance path on the GPU;
+  - returns paired `raw_action_data` (normalized, original action dimension)
+    and `action_data` (denormalized executable actions), and advertises the
+    capability through checkpoint deployment metadata. Protobuf remains
+    unchanged for non-RTC requests; remote RTC is deliberately msgpack-only.
+- Client implementation:
+  - added `Tron2RemoteRTCInferenceRunner`, reusing the existing 30 Hz consumer
+    and single-waypoint ServoJ submission but removing client-side cross-fade;
+  - maintains synchronized NumPy raw/processed queues, sends the atomic raw
+    remainder with a fresh observation, continues consuming processed old
+    actions during inference, and replaces both queues after discarding the
+    number of frames actually consumed by the client action clock;
+  - uses `action_chunk=50`, `execute_horizon=10`, and therefore a 40-frame
+    latency reserve. Dynamic prefix length is
+    `ceil(previous E2E latency / policy dt) + 2`, capped by the available old
+    plan; guidance decays for five more frames with the exponential schedule;
+  - requires `method='guidance'` because the active checkpoint was not trained
+    with RTC prefix conditioning, and refuses an older GPU service that does
+    not advertise the new paired-action protocol.
+- Lightweight PCM boundary:
+  - fixed the existing remote-only import path so it no longer imports Torch,
+    `safetensors.torch`, Torch dtype helpers, or training-only builders;
+  - remote predictions now remain NumPy arrays on the PCM. Local/full model
+    behavior retains Torch imports and dtype conversion.
+- Documentation updated: English/Chinese README, TRON2 deployment guide,
+  remote-serving protocol guide, and RTC guide now describe GPU-side guidance,
+  the paired queues, the 50/10/40 timing, dynamic prefix, msgpack requirement,
+  and mandatory GPU-service restart.
+- Validation actually executed:
+  - `pytest -q test/test_ci_smoke.py test/test_tron2_env_operator.py` passed 31
+    tests with five existing third-party warnings;
+  - added tests for RTC msgpack NumPy round-trip, strict server input
+    validation, raw/processed response pairing through a fake model handler,
+    dynamic prefix construction, paired-queue execution, and importing the
+    remote client while all Torch imports are blocked;
+  - focused `py_compile`, launcher `bash -n`, `git diff --check`, and YAPF diff
+    checks passed;
+  - no GPU model service was running on local port 3333, so a real checkpoint
+    inference was not started or claimed as validation.
+- PCM synchronization:
+  - confirmed no inference/client/MotionController process was running;
+  - backed up replaced files under
+    `/home/guest/FluxVLA-Tron2/.sync-backups/20260804-remote-rtc.AwTJc2`;
+  - synchronized only the config, lightweight runner/serializer/utils files,
+    and launcher required by the robot client;
+  - PCM Python compilation, config parsing (`guidance`, chunk 50, horizon 10,
+    reserve 40), launcher syntax, exact Torch-free preflight import, and
+    local/PCM SHA-256 equality for all nine synchronized files passed;
+  - confirmed again that no inference or robot-control process was running.
+- Safety and remaining risks:
+  - no Bridge episode, GPU checkpoint inference, control WebSocket, MoveJ,
+    ServoJ, gripper command, or physical robot action was started;
+  - the earlier unresolved 16-D MotionController startup hold-frame head motion
+    remains unchanged and can still block real execution before the first
+    policy waypoint. Remote RTC does not address or bypass that guard;
+  - the GPU service must be restarted with this RTC code before a
+    dry run. Real latency, reserve, and boundary diagnostics remain untested on
+    the deployed checkpoint/robot pair.

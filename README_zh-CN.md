@@ -519,8 +519,11 @@ dry run 不会真正执行 prepare pose，只验证真实执行前的交互流�
 dry run 仍会按 30 Hz 消费模拟动作队列，但不会连接机器人控制接口。预期日志包括：
 
 ```text
-[Overlap] Started: chunk=50, execution_horizon=25, trigger_queue=25, blend=0.00->1.00
+[RemoteRTC] Started: chunk=50 execution_horizon=10 reserve=40 first_e2e=...ms method=guidance
 ```
+
+GPU 服务端必须运行与客户端一致的新代码。旧服务端既不会返回归一化 raw action，
+也不会声明 remote RTC 能力；客户端遇到旧服务端时会在任务执行前主动停止。
 
 ## 10. 真实执行
 
@@ -544,10 +547,10 @@ bash scripts/remote_inference_client.sh \
 ```
 
 repeat count 为 1 时，`inference.execute_horizon=4` 会把第一次真机测试限制为
-4 个 30 Hz policy 帧。连续重叠运行时，这个值同时表示相邻两次推理开始之间的
-帧数；反复使用较短间隔前，必须先在 dry run 中确认端到端推理延迟。
+4 个 30 Hz policy 帧。该覆盖项只用于单次 commissioning 测试。连续 RTC 前，
+必须先在 dry run 中检查端到端推理延迟和 prefix 日志。
 
-确认行为稳定后，可以去掉该覆盖项，使用默认的 25 帧重叠间隔：
+确认行为稳定后，可以去掉该覆盖项，使用默认的 10 帧推理触发间隔：
 
 ```bash
 bash scripts/remote_inference_client.sh \
@@ -559,20 +562,34 @@ bash scripts/remote_inference_client.sh \
   --cfg-options inference.dry_run=False
 ```
 
-当前配置使用重叠 action chunk：
+当前配置使用无状态的服务端 guidance RTC：
 
 ```python
-type='Tron2OverlapInferenceRunner'
+type='Tron2RemoteRTCInferenceRunner'
 action_chunk=50
-execute_horizon=25
-blend_start_weight=0.0
-blend_end_weight=1.0
+execute_horizon=10
+rtc_config=dict(
+    enabled=True,
+    method='guidance',
+    prefix_len=None,
+    latency_margin_frames=2,
+    decay_frames=5,
+    schedule='exp',
+    max_guidance_weight=5.0,
+    use_vjp=False,
+)
 ```
 
-客户端执行 25 帧后获取新观测；远程推理期间继续执行旧计划；返回后按照实际已经
-消费的帧数对齐新 chunk，并让手臂关节目标从旧计划渐变到新计划。最后一次请求只
-执行一个 execution horizon。夹爪在旧值和新值之间切换而不取平均。GPU 服务器
-仍然执行普通 FluxVLA 推理，机器人客户端不加载模型。
+客户端通常执行 10 帧后获取新观测，并将其余 40 帧保留为远程推理的延迟余量。
+推理期间继续执行旧的 processed plan；请求中发送新观测以及尚未执行的、归一化
+raw plan。GPU 服务器运行 FluxVLA 原版 inference-time guidance RTC，同时返回新的
+归一化 raw chunk 和反归一化可执行 chunk。客户端根据推理期间实际消费的帧数替换
+两条成对队列。PCM 不运行 Torch/模型，也不再对两个 chunk 做数值 cross-fade。
+
+当 `prefix_len=None` 时，prefix 长度为
+`ceil(上一次端到端延迟 / policy_dt) + latency_margin_frames`，并受剩余旧计划长度
+限制。当前权重没有使用 RTC prefix conditioning 训练，因此这里明确采用仅推理时
+的 `method='guidance'`，而不是 `method='prefix'`。
 
 ## 11. 进入初始位姿
 
@@ -670,9 +687,11 @@ python -c "import socket; socket.create_connection(('10.192.1.2', 5000), timeout
 ```text
 configs/pi05/pi05_paligemma_tron2_lora_finetune.py
 fluxvla/engines/runners/tron2_inference_runner.py
+fluxvla/engines/runners/tron2_remote_rtc_inference_runner.py
 fluxvla/engines/operators/tron2_env_operator.py
 fluxvla/engines/operators/tron2_operator.py
 fluxvla/engines/runners/base_inference_runner.py
+fluxvla/engines/runners/serving/zmq_server.py
 fluxvla/transforms/normalize.py
 scripts/remote_inference_client.sh
 ```
@@ -683,7 +702,8 @@ scripts/remote_inference_client.sh
 | ----------------------------- | -------------------------------- |
 | `inference.dry_run=True`      | 完成推理链路，但不执行机器人动作 |
 | `inference.dry_run=False`     | 在机器人上执行返回动作           |
-| `inference.execute_horizon=25` | 相邻重叠推理开始之间的帧数      |
+| `inference.execute_horizon=10` | 远程 RTC 请求的名义间隔；chunk 其余部分作为延迟余量 |
+| `inference.rtc_config.prefix_len=None` | 根据上一次端到端延迟动态确定 guidance prefix |
 | `inference.operator.ws_port`  | Tron2 WebSocket 控制端口         |
 | `inference.operator.servoj_publish_rate` | ServoJ 后台发布频率（300 Hz） |
 | `inference.operator.max_servoj_step_rad` | 相邻路点变化上限（rad） |

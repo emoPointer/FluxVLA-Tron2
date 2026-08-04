@@ -162,6 +162,7 @@ class Tron2InferenceRunner(BaseInferenceRunner):
             str(task_id): description.strip()
             for task_id, description in task_descriptions.items()
         }
+        self.deployment_metadata = dict(response)
 
         from ..utils import initialize_overwatch
         overwatch = initialize_overwatch(__name__)

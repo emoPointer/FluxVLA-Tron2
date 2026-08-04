@@ -12,22 +12,33 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import io
 import json
+import os
 import runpy
+import subprocess
+import sys
 from pathlib import Path
 import threading
 from unittest.mock import patch
 
 import numpy as np
 import pytest
+import torch
 from mmengine import Config
 from tron2_env.rtc import ActionQueue
 
+from fluxvla.engines.runners.serving.serializers import MsgSerializer
+from fluxvla.engines.runners.serving.serializers import encode_predict_request
 from fluxvla.engines.runners.serving.serve import load_deployment_metadata
+from fluxvla.engines.runners.serving.zmq_server import create_server
+from fluxvla.engines.runners.serving.zmq_server import prepare_remote_rtc_inputs
 from fluxvla.engines.runners.tron2_inference_runner import (
     Tron2InferenceRunner, )
 from fluxvla.engines.runners.tron2_overlap_inference_runner import (
     Tron2OverlapInferenceRunner, )
+from fluxvla.engines.runners.tron2_remote_rtc_inference_runner import (
+    Tron2RemoteRTCInferenceRunner, )
 
 ROOT = Path(__file__).resolve().parents[1]
 
@@ -46,12 +57,20 @@ def test_tron2_lora_config_deployment_defaults():
     assert inference['dry_run'] is False
     assert inference['enable_head_control'] is False
     assert inference['publish_rate'] == 30
-    assert inference['type'] == 'Tron2OverlapInferenceRunner'
+    assert inference['type'] == 'Tron2RemoteRTCInferenceRunner'
     assert inference['action_chunk'] == 50
-    assert inference['execute_horizon'] == 25
-    assert inference['blend_start_weight'] == 0.0
-    assert inference['blend_end_weight'] == 1.0
+    assert inference['execute_horizon'] == 10
     assert inference['max_queue_empty_steps'] == 3
+    assert inference['rtc_config'] == {
+        'enabled': True,
+        'method': 'guidance',
+        'prefix_len': None,
+        'latency_margin_frames': 2,
+        'decay_frames': 5,
+        'schedule': 'exp',
+        'max_guidance_weight': 5.0,
+        'use_vjp': False,
+    }
     assert inference['remote_inference']['server_host'] == '127.0.0.1'
     assert inference['remote_inference']['server_port'] == 5555
     assert operator['type'] == 'Tron2EnvOperator'
@@ -304,6 +323,247 @@ def test_overlap_consumer_reports_queue_underrun():
     assert shutdown_event.is_set()
     assert len(errors) == 1
     assert 'queue underrun' in str(errors[0])
+
+
+def test_remote_rtc_msgpack_request_round_trip():
+    prev_actions = np.arange(48, dtype=np.float32).reshape(3, 16)
+    request = encode_predict_request(
+        {'qpos': np.zeros(16, dtype=np.float32)},
+        'private',
+        rtc={
+            'prev_actions': prev_actions,
+            'prefix_len': 2,
+            'config': {
+                'enabled': True,
+                'method': 'guidance',
+            },
+        },
+    )
+
+    parsed = MsgSerializer.from_bytes(request)
+
+    assert parsed['endpoint'] == 'predict_action'
+    assert parsed['data']['unnorm_key'] == 'private'
+    np.testing.assert_array_equal(parsed['data']['rtc']['prev_actions'],
+                                  prev_actions)
+    assert parsed['data']['rtc']['prefix_len'] == 2
+
+
+def test_remote_client_imports_without_torch():
+    script = """
+import builtins
+
+real_import = builtins.__import__
+
+def guarded_import(name, *args, **kwargs):
+    if name == 'torch' or name.startswith('torch.'):
+        raise ModuleNotFoundError('torch is unavailable on the robot client')
+    return real_import(name, *args, **kwargs)
+
+builtins.__import__ = guarded_import
+from fluxvla.engines.operators import Tron2EnvOperator
+from fluxvla.engines.runners import Tron2RemoteRTCInferenceRunner
+print('torch-free remote import ok')
+"""
+    env = dict(os.environ)
+    env['FLUXVLA_REMOTE_CLIENT_ONLY'] = '1'
+
+    result = subprocess.run(
+        [sys.executable, '-c', script],
+        cwd=ROOT,
+        env=env,
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+
+    assert result.returncode == 0, result.stderr
+    assert result.stdout.strip() == 'torch-free remote import ok'
+
+
+def test_remote_rtc_server_inputs_are_validated_and_moved_to_reference():
+    reference = torch.zeros((1, 16), dtype=torch.bfloat16)
+    payload = {
+        'prev_actions': np.ones((8, 16), dtype=np.float32),
+        'prefix_len': 5,
+        'config': {
+            'enabled': True,
+            'method': 'guidance',
+            'decay_end': 8,
+            'schedule': 'exp',
+            'max_guidance_weight': 5.0,
+            'use_vjp': False,
+        },
+    }
+
+    inputs = prepare_remote_rtc_inputs(payload, reference, 50)
+
+    assert inputs['prev_actions'].shape == (1, 8, 16)
+    assert inputs['prev_actions'].dtype == torch.bfloat16
+    assert inputs['prefix_len'] == 5
+    assert inputs['rtc_config'] == {
+        'method': 'guidance',
+        'decay_end': 8,
+        'schedule': 'exp',
+        'max_guidance_weight': 5.0,
+        'use_vjp': False,
+    }
+
+    invalid = dict(payload)
+    invalid['prev_actions'] = np.full((8, 16), np.nan, dtype=np.float32)
+    with pytest.raises(ValueError, match='non-finite'):
+        prepare_remote_rtc_inputs(invalid, reference, 50)
+
+    with pytest.raises(ValueError, match='action dimension'):
+        prepare_remote_rtc_inputs(payload, reference, 50, 14)
+
+
+def test_remote_rtc_server_returns_raw_and_processed_action_pairs():
+
+    class FakeVLA:
+        n_action_steps = 4
+        ori_action_dim = 2
+
+        def __init__(self):
+            self.inputs = None
+
+        def eval(self):
+            return self
+
+        def to(self, _device):
+            return self
+
+        def predict_action(self, **inputs):
+            self.inputs = inputs
+            return torch.arange(16, dtype=torch.float32).reshape(1, 4, 4)
+
+    fake_vla = FakeVLA()
+
+    def dataset(_obs):
+        return {'states': torch.zeros((1, 2), dtype=torch.float32)}
+
+    def denormalize(sample):
+        return sample['action'][:, :2] + 100.0
+
+    server = create_server(
+        fake_vla,
+        dataset=dataset,
+        denormalize_action=denormalize,
+        host='127.0.0.1',
+        port=0,
+        device='cpu',
+    )
+    rtc = {
+        'prev_actions': np.ones((3, 2), dtype=np.float32),
+        'prefix_len': 2,
+        'config': {
+            'enabled': True,
+            'method': 'guidance',
+            'decay_end': 3,
+            'schedule': 'linear',
+            'max_guidance_weight': 4.0,
+            'use_vjp': False,
+        },
+    }
+
+    try:
+        response = server._endpoints['predict_action'].handler(
+            obs_data=MsgSerializer.to_bytes({}),
+            unnorm_key='private',
+            rtc=rtc,
+        )
+        metadata = server._endpoints['get_deployment_metadata'].handler()
+    finally:
+        server.socket.close(linger=0)
+        server.context.term()
+
+    raw = np.load(io.BytesIO(response['raw_action_data']), allow_pickle=False)
+    processed = np.load(
+        io.BytesIO(response['action_data']), allow_pickle=False)
+
+    assert raw.shape == processed.shape == (1, 4, 2)
+    np.testing.assert_array_equal(raw[0], [[0, 1], [4, 5], [8, 9], [12, 13]])
+    np.testing.assert_array_equal(processed, raw + 100.0)
+    assert fake_vla.inputs['prev_actions'].shape == (1, 3, 2)
+    assert fake_vla.inputs['prefix_len'] == 2
+    assert fake_vla.inputs['rtc_config'] == {
+        'method': 'guidance',
+        'decay_end': 3,
+        'schedule': 'linear',
+        'max_guidance_weight': 4.0,
+        'use_vjp': False,
+    }
+    assert metadata['remote_rtc']['returns_raw_actions'] is True
+
+
+def test_remote_rtc_runner_builds_dynamic_guidance_payload():
+    runner = Tron2RemoteRTCInferenceRunner.__new__(
+        Tron2RemoteRTCInferenceRunner)
+    runner.action_chunk = 50
+    runner.dt = 1.0 / 30.0
+    runner.rtc_prefix_len = None
+    runner.rtc_latency_margin_frames = 2
+    runner.rtc_decay_frames = 5
+    runner.rtc_schedule = 'exp'
+    runner.rtc_max_guidance_weight = 5.0
+    runner.rtc_use_vjp = False
+    runner._last_e2e_latency_s = 0.20
+    raw_left_over = np.zeros((40, 16), dtype=np.float32)
+
+    prefix_len = runner._resolve_prefix_len(raw_left_over)
+    payload = runner._build_rtc_payload(raw_left_over, prefix_len)
+
+    assert prefix_len == 8
+    assert payload['prefix_len'] == 8
+    assert payload['config']['decay_end'] == 13
+    np.testing.assert_array_equal(payload['prev_actions'], raw_left_over)
+
+
+def test_remote_rtc_episode_keeps_raw_prefix_and_executes_processed_actions():
+    runner = Tron2RemoteRTCInferenceRunner.__new__(
+        Tron2RemoteRTCInferenceRunner)
+    runner.action_layout = 'tron2_16'
+    runner.action_chunk = 4
+    runner.execute_horizon = 2
+    runner.queue_poll_interval_s = 0.0005
+    runner.max_queue_empty_steps = 10
+    runner.dt = 0.02
+    runner.rtc_prefix_len = 1
+    runner.rtc_latency_margin_frames = 0
+    runner.rtc_decay_frames = 1
+    runner.rtc_schedule = 'linear'
+    runner.rtc_max_guidance_weight = 3.0
+    runner.rtc_use_vjp = False
+    runner._last_e2e_latency_s = None
+    runner._prev_ctx = None
+    runner._action_ctx = None
+
+    raw_chunks = [
+        np.repeat(np.arange(4, dtype=np.float32)[:, None], 16, axis=1),
+        np.full((4, 16), 10.0, dtype=np.float32),
+        np.full((4, 16), 20.0, dtype=np.float32),
+    ]
+    processed_chunks = [chunk + 100.0 for chunk in raw_chunks]
+    requests = []
+    executed = []
+    runner._get_user_task_instruction = lambda _: ['task'] * 3
+    runner._preprocess = lambda _: {'unnorm_key': 'private'}
+
+    def request_pair(inputs, rtc=None):
+        requests.append(rtc)
+        return raw_chunks.pop(0), processed_chunks.pop(0), 0.001
+
+    runner._request_action_pair = request_pair
+    runner._execute_waypoint = lambda action: executed.append(action.copy())
+
+    runner._run_episode('unused')
+
+    assert len(executed) == 3 * runner.execute_horizon
+    assert all(float(action[0]) >= 100.0 for action in executed)
+    assert requests[0] is None
+    assert len(requests[1]['prev_actions']) >= runner.execute_horizon
+    assert requests[1]['prev_actions'][0, 0] >= 2.0
+    assert requests[1]['config']['method'] == 'guidance'
 
 
 def test_tron2_runner_requires_explicit_checkpoint_task_id():

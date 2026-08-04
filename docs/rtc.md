@@ -141,6 +141,31 @@ inference = dict(
 - Test-time RTC: keeps training unchanged and uses `method='guidance'` at inference.
 - In a single inference pass, `prefix` and `guidance` are typically used as alternative routes.
 
+### Remote test-time RTC for TRON2
+
+`Tron2RemoteRTCInferenceRunner` keeps all Torch, denoising, and guidance work on
+the GPU server. The robot client stores two synchronized NumPy queues:
+
+- normalized raw actions, used only as the next guidance prefix;
+- denormalized processed actions, submitted to the robot controller.
+
+After the execution horizon, the client collects a fresh observation and sends
+the exact unconsumed raw queue in the msgpack request. The old processed queue
+continues executing during inference. The server applies the same
+`PI0FlowMatching._predict_action_guidance_rtc` path documented above and returns
+both the new raw and processed chunks. The client then discards the number of
+new frames corresponding to actual queue consumption during the request and
+atomically installs the remaining pair. The protocol is stateless; the server
+does not retain per-robot previous actions.
+
+The TRON2 PI0.5 LoRA deployment uses a 50-frame action chunk, a 10-frame nominal
+execution horizon, and a 40-frame latency reserve. With `prefix_len=None`, the
+client estimates the next guidance prefix from the previous end-to-end request
+latency plus a configurable safety margin. The current checkpoint was trained
+without RTC prefix conditioning, so `method='guidance'` is required. Remote RTC
+requires msgpack and a server restart after protocol changes; no Torch runtime
+is needed on the robot PCM.
+
 ## Testing
 
 The repository provides `scripts/test_rtc.py` to test and visualize RTC inference behavior. It:

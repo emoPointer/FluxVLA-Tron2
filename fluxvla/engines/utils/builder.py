@@ -16,7 +16,6 @@ import inspect
 import logging
 from typing import Any, Optional, Union
 
-import torch.nn as nn
 from mmengine.config import Config, ConfigDict
 from mmengine.utils import ManagerMixin
 

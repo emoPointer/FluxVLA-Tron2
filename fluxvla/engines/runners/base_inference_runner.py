@@ -12,8 +12,10 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import contextlib
 import io
 import os
+import random
 import threading
 import time
 from pathlib import Path
@@ -22,12 +24,19 @@ from typing import Dict, List, Optional
 
 import cv2
 import numpy as np
-import torch
-from safetensors.torch import load_file
 
-from fluxvla.engines.utils.torch_utils import set_seed_everywhere
 from ..utils import build_operator_from_cfg, initialize_overwatch
-from ..utils.name_map import str_to_dtype
+
+_REMOTE_CLIENT_ONLY = os.getenv('FLUXVLA_REMOTE_CLIENT_ONLY', '0') == '1'
+if not _REMOTE_CLIENT_ONLY:
+    import torch
+    from safetensors.torch import load_file
+
+    from fluxvla.engines.utils.torch_utils import set_seed_everywhere
+    from ..utils.name_map import str_to_dtype
+else:
+    torch = None
+    load_file = None
 
 overwatch = initialize_overwatch(__name__)
 
@@ -96,12 +105,11 @@ class BaseInferenceRunner:
                  enable_mixed_precision: bool = True,
                  remote_inference: Dict = None,
                  **kwargs):
-        from fluxvla.engines import (build_dataset_from_cfg,
-                                     build_transform_from_cfg,
-                                     build_vla_from_cfg)
-
         self.ckpt_path = ckpt_path
         self._use_remote = remote_inference is not None
+        if _REMOTE_CLIENT_ONLY and not self._use_remote:
+            raise ValueError('FLUXVLA_REMOTE_CLIENT_ONLY requires a '
+                             'remote_inference configuration.')
 
         if self._use_remote:
             self.dataset = None
@@ -109,6 +117,10 @@ class BaseInferenceRunner:
             self.vla = None
             self._init_zmq_client(remote_inference)
         elif ckpt_path is not None:
+            from fluxvla.engines import (build_dataset_from_cfg,
+                                         build_transform_from_cfg,
+                                         build_vla_from_cfg)
+
             data_stat_path = os.path.join(
                 Path(ckpt_path).resolve().parent.parent,
                 'dataset_statistics.json')
@@ -159,7 +171,9 @@ class BaseInferenceRunner:
         self.task_pose_sequences = task_pose_sequences or {}
 
         # Mixed precision settings
-        self.mixed_precision_dtype = str_to_dtype(mixed_precision_dtype)
+        self.mixed_precision_dtype = (
+            mixed_precision_dtype
+            if self._use_remote else str_to_dtype(mixed_precision_dtype))
         self.enable_mixed_precision = enable_mixed_precision
 
         # Action context: SimpleNamespace shared between _predict_action,
@@ -273,7 +287,11 @@ class BaseInferenceRunner:
         GPU, and sets random seeds.  In remote mode, pings the ZMQ
         server to verify connectivity.
         """
-        set_seed_everywhere(self.seed)
+        if self._use_remote:
+            random.seed(self.seed)
+            np.random.seed(self.seed)
+        else:
+            set_seed_everywhere(self.seed)
         if self._use_remote:
             if not self.ping():
                 raise ConnectionError(
@@ -313,7 +331,10 @@ class BaseInferenceRunner:
         overwatch.info('Starting inference runner')
 
         # Main inference loop
-        with torch.inference_mode():
+        inference_context = (
+            contextlib.nullcontext
+            if self._use_remote else torch.inference_mode)
+        with inference_context():
             while not rospy.is_shutdown():
                 self._run_episode(initial_instruction)
 
@@ -345,11 +366,14 @@ class BaseInferenceRunner:
                 self._action_ctx.instruction = instruction
                 inputs = self._preprocess(instruction)
 
-                with torch.autocast(
+                autocast_context = (
+                    contextlib.nullcontext()
+                    if self._use_remote else torch.autocast(
                         'cuda',
                         dtype=self.mixed_precision_dtype,
-                        enabled=(self.enable_mixed_precision
-                                 and not self._use_remote)):
+                        enabled=self.enable_mixed_precision,
+                    ))
+                with autocast_context:
                     raw_action = self._predict_action(inputs)
 
                 actions = self._postprocess_actions(raw_action)
@@ -406,6 +430,22 @@ class BaseInferenceRunner:
         Returns:
             torch.Tensor: Action tensor from remote server.
         """
+        response = self._request_remote_action(inputs)
+
+        action_buf = io.BytesIO(response['action_data'])
+        arr = np.load(action_buf, allow_pickle=False)
+        if self._use_remote:
+            return arr.copy()
+        return torch.from_numpy(arr.copy())
+
+    def _request_remote_action(self, inputs: dict, rtc: dict = None) -> dict:
+        """Execute one remote prediction request and return its wire response.
+
+        ``rtc`` is a msgpack-only, NumPy-compatible payload used by remote RTC
+        runners. Keeping this transport method below model-specific runners
+        lets the robot client send a normalized previous-action prefix without
+        performing any model or guidance computation locally.
+        """
         from .serving.serializers import (FORMAT_PROTOBUF,
                                           decode_predict_response,
                                           encode_predict_request)
@@ -416,7 +456,7 @@ class BaseInferenceRunner:
         t0 = time.perf_counter()
         obs = {}
         for k, v in inputs.items():
-            if isinstance(v, torch.Tensor):
+            if torch is not None and isinstance(v, torch.Tensor):
                 obs[k] = v.cpu().numpy()
             else:
                 obs[k] = v
@@ -424,7 +464,8 @@ class BaseInferenceRunner:
             obs,
             str(unnorm_key),
             fmt=self._serializer,
-            compress=self._compress)
+            compress=self._compress,
+            rtc=rtc)
         payload_size = len(request)
         t_serialize = time.perf_counter() - t0
 
@@ -432,18 +473,15 @@ class BaseInferenceRunner:
         with self._zmq_lock:
             self._zmq_socket.send(request)
             raw_response = self._zmq_socket.recv()
+        t_zmq = time.perf_counter() - t1
+
+        t2 = time.perf_counter()
         fmt_tag = FORMAT_PROTOBUF if self._serializer == 'protobuf' else 0
         response = decode_predict_response(raw_response, fmt=fmt_tag)
-        t_zmq = time.perf_counter() - t1
+        t_deserialize = time.perf_counter() - t2
 
         if isinstance(response, dict) and 'error' in response:
             raise RuntimeError(f"ZMQ server error: {response['error']}")
-
-        t2 = time.perf_counter()
-        action_buf = io.BytesIO(response['action_data'])
-        arr = np.load(action_buf, allow_pickle=False)
-        actions = torch.from_numpy(arr.copy())
-        t_deserialize = time.perf_counter() - t2
 
         t_total = time.perf_counter() - t_total_start
         server_infer = response.get('infer_time', 0.0)
@@ -485,7 +523,7 @@ class BaseInferenceRunner:
                     f'avg_payload={self._payload_bytes/n/1024:.0f}KB  '
                     f'avg_resp={self._resp_bytes/n/1024:.0f}KB')
 
-        return actions
+        return response
 
     def _postprocess_actions(self, raw_action):
         """Denormalize raw actions into robot command space.
@@ -500,7 +538,7 @@ class BaseInferenceRunner:
             np.ndarray: Denormalized actions, truncated to action_chunk.
         """
         if self._use_remote:
-            actions = raw_action.cpu().numpy()
+            actions = np.asarray(raw_action)
             if actions.ndim == 3 and actions.shape[0] == 1:
                 actions = actions[0]
             return actions[:self.action_chunk]

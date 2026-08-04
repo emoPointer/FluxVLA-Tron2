@@ -561,13 +561,17 @@ Number of times to repeat the task: 1
 In dry-run mode, the prepare-pose command is not executed; this only verifies
 the interaction flow before real execution.
 
-Expected dry-run output includes the overlap timing configuration. Dry run
+Expected dry-run output includes the remote RTC timing configuration. Dry run
 still consumes the simulated action queue at 30 Hz, but never opens the robot
 control transport:
 
 ```text
-[Overlap] Started: chunk=50, execution_horizon=25, trigger_queue=25, blend=0.00->1.00
+[RemoteRTC] Started: chunk=50 execution_horizon=10 reserve=40 first_e2e=...ms method=guidance
 ```
+
+The GPU server must run the same revision as the client. An older server does
+not return normalized raw actions or advertise remote RTC capability, and the
+client intentionally stops before task execution in that case.
 
 ## 10. Execute on the Robot
 
@@ -591,12 +595,12 @@ bash scripts/remote_inference_client.sh \
 ```
 
 With a repeat count of 1, `inference.execute_horizon=4` limits the first real
-test to four 30 Hz policy frames. For continuous overlap runs it also controls
-the interval between inference starts; validate end-to-end inference latency
-in dry run before using such a short interval repeatedly.
+test to four 30 Hz policy frames. Use this override only for the single-repeat
+commissioning test. For continuous RTC, first validate end-to-end inference
+latency and prefix diagnostics in dry run.
 
 After the behavior is verified, remove the override to use the default
-25-frame overlap interval:
+10-frame inference trigger:
 
 ```bash
 bash scripts/remote_inference_client.sh \
@@ -608,22 +612,38 @@ bash scripts/remote_inference_client.sh \
   --cfg-options inference.dry_run=False
 ```
 
-The default deployment uses overlapping chunks:
+The default deployment uses stateless server-side guidance RTC:
 
 ```python
-type='Tron2OverlapInferenceRunner'
+type='Tron2RemoteRTCInferenceRunner'
 action_chunk=50
-execute_horizon=25
-blend_start_weight=0.0
-blend_end_weight=1.0
+execute_horizon=10
+rtc_config=dict(
+    enabled=True,
+    method='guidance',
+    prefix_len=None,
+    latency_margin_frames=2,
+    decay_frames=5,
+    schedule='exp',
+    max_guidance_weight=5.0,
+    use_vjp=False,
+)
 ```
 
-The client obtains a fresh observation after 25 frames, continues executing
-the old plan during remote inference, aligns the returned chunk by the number
-of frames actually consumed, and cross-fades arm targets from old to new. The
-last requested chunk is limited to the execution horizon; grippers switch
-between old/new values rather than being averaged. The GPU server still runs
-ordinary FluxVLA inference, and the robot client remains model-free.
+The client normally obtains a fresh observation after 10 frames and leaves the
+other 40 frames as a latency reserve. While remote inference is running it
+continues executing the old processed plan. With the fresh observation it
+sends the exact unconsumed normalized old plan; the GPU runs FluxVLA's
+inference-time guidance RTC and returns both the normalized raw chunk and the
+denormalized executable chunk. The client replaces its paired queues after
+discarding the number of frames actually consumed in flight. No Torch/model
+code and no numerical chunk cross-fade run on the PCM.
+
+When `prefix_len=None`, the guided prefix is
+`ceil(previous_end_to_end_latency / policy_dt) + latency_margin_frames`, capped
+by the available old plan. The current checkpoint was not trained with RTC
+prefix conditioning, so this deployment deliberately uses inference-only
+`method='guidance'`, not `method='prefix'`.
 
 ## 11. Move to the Prepare Pose
 
@@ -730,9 +750,11 @@ The current Tron2 deployment branch changes these main files:
 ```text
 configs/pi05/pi05_paligemma_tron2_lora_finetune.py
 fluxvla/engines/runners/tron2_inference_runner.py
+fluxvla/engines/runners/tron2_remote_rtc_inference_runner.py
 fluxvla/engines/operators/tron2_env_operator.py
 fluxvla/engines/operators/tron2_operator.py
 fluxvla/engines/runners/base_inference_runner.py
+fluxvla/engines/runners/serving/zmq_server.py
 fluxvla/transforms/normalize.py
 scripts/remote_inference_client.sh
 ```
@@ -743,7 +765,8 @@ The most important runtime switches are:
 | ----------------------------- | ---------------------------------------- |
 | `inference.dry_run=True`      | full inference flow, no robot action     |
 | `inference.dry_run=False`     | execute returned actions on the robot    |
-| `inference.execute_horizon=25` | frames between overlap inference starts |
+| `inference.execute_horizon=10` | nominal frames between remote RTC requests; remaining chunk is latency reserve |
+| `inference.rtc_config.prefix_len=None` | size guidance prefix from previous end-to-end latency |
 | `inference.operator.ws_port`  | Tron2 WebSocket controller port          |
 | `inference.operator.servoj_publish_rate` | ServoJ background rate (300 Hz) |
 | `inference.operator.max_servoj_step_rad` | Per-waypoint delta guard (rad) |

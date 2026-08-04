@@ -198,6 +198,7 @@ by adding `remote_inference` to its config:
 | `AlohaInferenceRunner`    | Aloha dual-arm       |
 | `AlohaRTCInferenceRunner` | Aloha dual-arm + RTC |
 | `Tron2OverlapInferenceRunner` | TRON2 dual-arm + client-side overlap blending |
+| `Tron2RemoteRTCInferenceRunner` | TRON2 + server-side guidance RTC; model-free client |
 
 ### Client config options (remote_inference dict)
 
@@ -238,14 +239,22 @@ Both formats use the same payload encoding for observation data:
 - Numeric arrays: numpy `.npy` format bytes
 - Strings: passed directly
 
+Stateless remote RTC is msgpack-only. Its optional `rtc` request field carries
+the unconsumed normalized `prev_actions`, `prefix_len`, and a validated RTC
+configuration. The response adds `raw_action_data` (normalized model-space
+actions) alongside `action_data` (denormalized executable actions). Ordinary
+clients ignore the additional response field. Protobuf prediction remains
+available for non-RTC requests.
+
 ## Endpoints
 
 | Endpoint         | Input            | Output                             | Description        |
 | ---------------- | ---------------- | ---------------------------------- | ------------------ |
-| `predict_action` | obs + unnorm_key | action bytes + infer_time          | Model inference    |
+| `predict_action` | obs + unnorm_key + optional RTC prefix | processed/raw action bytes + infer_time | Model inference |
 | `ping`           | (none)           | `{status: ok}`                     | Health check       |
 | `reset`          | (none)           | `{status: ok}`                     | Reset server state |
 | `get_status`     | (none)           | uptime, request count, avg latency | Server stats       |
+| `get_deployment_metadata` | (none)   | task/action metadata and capabilities | Client compatibility check |
 | `kill`           | (none)           | `{status: ok}`                     | Graceful shutdown  |
 
 ## Data Flow
@@ -264,3 +273,10 @@ Client (robot)                    Server (GPU)
      |  decode action                  |
      |  execute on robot               |
 ```
+
+For `Tron2RemoteRTCInferenceRunner`, the client continues consuming the old
+processed queue while the request is in flight. The GPU applies FluxVLA
+guidance to the normalized old prefix. On reply, the client atomically replaces
+its normalized/raw and executable/processed queues after dropping the number
+of frames actually consumed during inference. The server is stateless: every
+RTC request carries its complete prefix context.
