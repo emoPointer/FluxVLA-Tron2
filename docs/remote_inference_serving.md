@@ -181,11 +181,12 @@ the model).
 
 ### Runtime interaction
 
-During inference, the terminal prompts for task selection:
-
-- Enter a task ID (e.g. `1`, `2`, ...) to run a predefined task
-- Enter `0` to reset the robot to its prepare pose (local ROS, no network)
-- Enter the number of times to repeat the task
+The standard TRON2 remote client handles its keyboard state locally on the
+Power Computing Module: enter a checkpoint-advertised task ID and press Enter,
+press `b` to start sequential non-RTC chunks, and press `s` to stop after any
+already accepted chunk finishes. While idle, `r` runs the prepare-pose MoveJ
+sequence. There is no repeat-count prompt, and the GPU server does not process
+keyboard input.
 
 ### Supported runners
 

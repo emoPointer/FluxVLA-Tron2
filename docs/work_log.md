@@ -659,3 +659,53 @@ commands and results that were actually executed.
   delta/head/data checks, first-chunk rejection without starting ServoJ, and
   active-controller target preservation. No robot process or action was
   started for this change.
+
+## 2026-08-04 21:15 CST — Restore the non-RTC PCM client with local keyboard control
+
+- Objective: retire the experimental TRON2 overlap/remote-RTC deployment while
+  retaining the requested robot-computer keyboard workflow and the relaxed
+  ServoJ rejection behavior.
+- Implementation:
+  - the active PI0.5 deployment again uses the standard
+    `Tron2InferenceRunner`, `action_chunk=32`, and the original prediction
+    request/response protocol; no overlap queue, guidance prefix, or
+    inference-time RTC is active;
+  - replaced the repeat-count prompt with a PCM-local TTY state machine: enter
+    and confirm a checkpoint task ID, `b` starts continuous sequential chunks,
+    `s` stops future inference/chunk acceptance while an already accepted full
+    chunk finishes, and idle-only `r` runs the former task-0 MoveJ prepare-pose
+    sequence;
+  - rejected action-validation chunks log a hold warning and leave the last
+    accepted ServoJ target unchanged instead of terminating the client;
+  - retained the independent lightweight-client import path so the PCM does
+    not need PyTorch. This compatibility was separated from the retired RTC
+    transport and runners after a PCM import check exposed the dependency.
+- PCM synchronization:
+  - confirmed no inference, tunnel, model-serving, or MotionController process
+    was running before and after synchronization;
+  - backed up all replaced runtime files and both RTC-only runner files under
+    `/home/guest/FluxVLA-Tron2/.sync-backups/20260804_210742-no-rtc-keyboard`;
+  - synchronized the three TRON2 configs, operator, standard runner/base
+    runner, standard serializers/server files, lightweight utility imports,
+    and launcher to `guest@10.192.1.4`;
+  - removed only `tron2_overlap_inference_runner.py` and
+    `tron2_remote_rtc_inference_runner.py` after backup. The upstream
+    `tron2_rtc_inference_runner.py` remains present but is neither registered
+    by the lightweight path nor selected by the active configuration.
+- Validation actually executed:
+  - focused local hardware-free tests passed (28 tests with five existing
+    third-party warnings), including the dedicated subprocess import
+    regression; local bytecode compilation, YAPF, shell syntax, torch-free
+    import, and `git diff --check` passed;
+  - on the PCM, Python 3.10 bytecode compilation and launcher shell syntax
+    passed; the resolved config reported `Tron2InferenceRunner`, chunk size 32,
+    no `rtc_config`/`execute_horizon`, a 0.2-rad ServoJ step limit, disabled
+    duplicate source mismatch check, and head lock enabled;
+  - the PCM imported the operator, standard runner, and terminal key reader
+    with no `torch` module loaded; a pseudo-TTY test read a single `s` key and
+    verified that terminal attributes were restored;
+  - SHA-256 values matched for all 13 synchronized runtime files.
+- Safety boundary: no inference client/server, SSH tunnel, Bridge observation,
+  robot-control WebSocket, MoveJ, ServoJ, gripper command, or physical action
+  was started during this migration. The two removed RTC-only files are
+  recoverable from the recorded PCM backup.

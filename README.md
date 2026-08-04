@@ -549,17 +549,17 @@ If the server is reachable only through port 22, keep this SSH tunnel mode.
 If SSH key login is configured, the command will not ask for a password.
 
 During dry run, the client first prints the task IDs advertised by the active
-checkpoint. Enter task ID `0` to use the prepare-pose flow, then enter one of
-those advertised task IDs:
+checkpoint. Type one of those IDs, press Enter to confirm it, and press `b` to
+start. Press `s` to stop generating and accepting further chunks:
 
 ```text
-Enter task ID (0 = prepare pose): 0
-Enter task ID after prepare pose: 6
-Number of times to repeat the task: 1
+Task ID: 6
+Press b to start, or type another task ID and press Enter.
 ```
 
-In dry-run mode, the prepare-pose command is not executed; this only verifies
-the interaction flow before real execution.
+There is no repeat-count prompt. The keyboard state machine runs on the Power
+Computing Module; the GPU server only handles prediction requests. In dry-run
+mode, pressing `r` while idle prints and skips the prepare-pose command.
 
 Expected dry-run output includes a printed action:
 
@@ -576,24 +576,7 @@ Only run real execution after:
 - WebSocket handshake succeeds;
 - a physical emergency stop is available.
 
-Start with a short execution horizon:
-
-```bash
-bash scripts/remote_inference_client.sh \
-  configs/pi05/pi05_paligemma_tron2_lora_finetune.py \
-  --ssh-host USER@SERVER_PUBLIC_IP \
-  --ssh-port 22 \
-  --local-port 5555 \
-  --remote-port 3333 \
-  --cfg-options inference.dry_run=False inference.execute_horizon=4
-```
-
-`inference.execute_horizon=4` means the robot executes only the first 4 action
-steps from each action chunk, then observes and queries the remote server again.
-This is safer for initial deployment.
-
-After the behavior is verified, remove `execute_horizon=4` to execute the full
-chunk:
+Start the standard non-RTC client:
 
 ```bash
 bash scripts/remote_inference_client.sh \
@@ -611,20 +594,25 @@ The current config uses:
 action_chunk=32
 ```
 
-so the default execution horizon is the full 32-step chunk.
+The client executes one complete 32-step chunk synchronously, then captures a
+new observation and requests the next chunk. This path has no overlap queue,
+guidance prefix, or inference-time RTC. Pressing `s` discards a prediction that
+has not yet been accepted; an already accepted chunk is allowed to finish, and
+no subsequent prediction is sent to the controller. A new run requires a new
+task-ID selection followed by `b`.
 
 ## 11. Move to the Prepare Pose
 
-During runtime interaction, enter task ID `0` to move the robot to the
-configured prepare pose:
+While the client is idle, press `r` to run the same configured prepare-pose
+sequence previously exposed as task ID `0`:
 
 ```text
-Enter task ID (0 = prepare pose): 0
-Enter task ID after prepare pose: 6
-Number of times to repeat the task: 1
+[TRON2 client idle] Type task ID and press Enter. b=start, r=prepare pose.
 ```
 
-In dry-run mode, prepare-pose execution is skipped.  In real execution mode,
+`r` is ignored while a task is running; press `s`, wait until the client
+reports idle, and only then press `r`. In dry-run mode, prepare-pose execution
+is skipped. In real execution mode,
 each prepare pose uses MoveJ and does not send a head target. Before the first
 policy action, the full chunk is checked against both Bridge and control
 feedback before a fresh `tron2_env` MotionController may stream ServoJ at
@@ -634,7 +622,7 @@ before any new MoveJ command is sent.
 
 ## 12. Important Safety Notes
 
-`Ctrl+C` runs client cleanup, stops the policy feeder, and disconnects the
+`Ctrl+C` runs client cleanup and disconnects the
 ServoJ publisher and control WebSocket.  It is still not a robot emergency
 stop: it does not disable torque or guarantee that a command already accepted
 by the Tron2 controller is canceled.
@@ -642,7 +630,7 @@ by the Tron2 controller is canceled.
 For first deployment on a new robot:
 
 - keep one operator near the physical emergency stop;
-- use `inference.execute_horizon=4`;
+- verify the selected checkpoint task ID before pressing `b`;
 - keep object placement conservative;
 - verify gripper open/close convention before full-speed runs;
 - keep `max_servoj_step_rad=0.2` until recorded trajectories justify a tighter
@@ -731,7 +719,6 @@ The most important runtime switches are:
 | ----------------------------- | ---------------------------------------- |
 | `inference.dry_run=True`      | full inference flow, no robot action     |
 | `inference.dry_run=False`     | execute returned actions on the robot    |
-| `inference.execute_horizon=4` | execute only the first 4 steps per chunk |
 | `inference.operator.ws_port`  | Tron2 WebSocket controller port          |
 | `inference.operator.servoj_publish_rate` | ServoJ background rate (300 Hz) |
 | `inference.operator.max_servoj_step_rad` | Per-waypoint delta guard (rad) |

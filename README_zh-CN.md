@@ -505,16 +505,17 @@ bash scripts/remote_inference_client.sh \
 如果服务器只能通过 22 端口访问，保留 SSH tunnel 模式。若已配置 SSH key，
 运行时不会再要求输入密码。
 
-dry run 启动时会先显示当前权重登记的任务 ID。输入 task ID `0` 验证
-prepare-pose 交互流程，然后输入其中一个已登记的任务 ID：
+dry run 启动时会先显示当前权重登记的任务 ID。输入其中一个任务 ID 并按
+Enter 确认，再按 `b` 开始；按 `s` 停止继续生成和接收新 chunk：
 
 ```text
-Enter task ID (0 = prepare pose): 0
-Enter task ID after prepare pose: 6
-Number of times to repeat the task: 1
+Task ID: 6
+Press b to start, or type another task ID and press Enter.
 ```
 
-dry run 不会真正执行 prepare pose，只验证真实执行前的交互流程。
+现在不再输入 repeat time。按键状态机在机器人 Power Computing Module 上
+运行，GPU 服务器只处理推理请求。dry run 空闲时按 `r` 会打印并跳过
+prepare pose。
 
 期望输出包含：
 
@@ -531,22 +532,7 @@ dry run 不会真正执行 prepare pose，只验证真实执行前的交互流�
 - WebSocket 连接稳定；
 - 现场有物理急停。
 
-首次部署建议使用较短的执行 horizon：
-
-```bash
-bash scripts/remote_inference_client.sh \
-  configs/pi05/pi05_paligemma_tron2_lora_finetune.py \
-  --ssh-host USER@SERVER_PUBLIC_IP \
-  --ssh-port 22 \
-  --local-port 5555 \
-  --remote-port 3333 \
-  --cfg-options inference.dry_run=False inference.execute_horizon=4
-```
-
-`inference.execute_horizon=4` 表示每个 action chunk 只执行前 4 步，然后重新
-观测并请求远程推理。初次部署更安全。
-
-确认行为稳定后，可以去掉 `execute_horizon=4`：
+启动标准的无 RTC 客户端：
 
 ```bash
 bash scripts/remote_inference_client.sh \
@@ -564,18 +550,20 @@ bash scripts/remote_inference_client.sh \
 action_chunk=32
 ```
 
-默认执行完整 32 步 action chunk。
+客户端同步执行完整 32 步 action chunk，执行完才重新取观测并请求下一个
+chunk。该路径没有 overlap 队列、guidance prefix 或 inference-time RTC。
+如果在推理结果尚未被接收时按 `s`，结果会被丢弃；已经接收的 chunk 会执行完，
+之后不再向控制器发送新动作。再次运行必须重新选择任务 ID，再按 `b`。
 
 ## 11. 进入初始位姿
 
-运行交互中输入 task ID `0`，机器人会进入配置好的 prepare pose：
+客户端空闲时按 `r`，会执行原 task ID `0` 使用的同一套 prepare pose：
 
 ```text
-Enter task ID (0 = prepare pose): 0
-Enter task ID after prepare pose: 6
-Number of times to repeat the task: 1
+[TRON2 client idle] Type task ID and press Enter. b=start, r=prepare pose.
 ```
 
+任务运行中按 `r` 无效；必须先按 `s`，等客户端回到 idle 后才能按 `r`。
 dry run 下不会执行 prepare pose。真实执行模式下，每个 prepare pose 使用 MoveJ，
 且不发送头部目标。第一次策略动作前，会先用 Bridge 与控制 WebSocket 的反馈校验
 整个动作段，校验通过后才允许新建 `tron2_env` MotionController 并以 300 Hz
@@ -584,14 +572,14 @@ prepare 时，会先断开 ServoJ 发布器，之后才发送新的 MoveJ。
 
 ## 12. 安全提醒
 
-`Ctrl+C` 会执行客户端清理，停止策略 feeder，并断开 ServoJ 发布器和控制
+`Ctrl+C` 会执行客户端清理，并断开 ServoJ 发布器和控制
 WebSocket，但它仍然不是机器人急停：不会自动卸力，也不能保证控制器已经接受
 的指令被取消。
 
 新机器人首次部署时：
 
 - 操作员应在物理急停旁；
-- 使用 `inference.execute_horizon=4`；
+- 按 `b` 前再次确认当前权重和所选任务 ID；
 - 物体摆放保守；
 - 完整运行前先确认夹爪开合约定；
 - 在有实测轨迹支持更严格阈值前，保持 `max_servoj_step_rad=0.2`。
@@ -675,7 +663,6 @@ scripts/remote_inference_client.sh
 | ----------------------------- | -------------------------------- |
 | `inference.dry_run=True`      | 完成推理链路，但不执行机器人动作 |
 | `inference.dry_run=False`     | 在机器人上执行返回动作           |
-| `inference.execute_horizon=4` | 每个 chunk 只执行前 4 步         |
 | `inference.operator.ws_port`  | Tron2 WebSocket 控制端口         |
 | `inference.operator.servoj_publish_rate` | ServoJ 后台发布频率（300 Hz） |
 | `inference.operator.max_servoj_step_rad` | 相邻路点变化上限（rad） |

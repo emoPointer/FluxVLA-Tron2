@@ -97,7 +97,7 @@ if [ -z "$PYTHON_BIN" ]; then
 fi
 
 if ! "$PYTHON_BIN" -c \
-    "import tron2_env, websockets; from fluxvla.engines.operators import Tron2EnvOperator"; then
+    "import tron2_env, websockets; from fluxvla.engines.operators import Tron2EnvOperator; from fluxvla.engines.runners import Tron2InferenceRunner"; then
     echo "[client] ERROR: lightweight client imports failed with $PYTHON_BIN."
     echo "[client] Install the pinned tron2-env bridge runtime (websockets>=12)."
     exit 1
