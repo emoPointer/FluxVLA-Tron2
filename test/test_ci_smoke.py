@@ -15,11 +15,14 @@
 import io
 import json
 import os
+import pty
 import runpy
 import subprocess
 import sys
+import termios
 from pathlib import Path
 import threading
+import time
 from unittest.mock import patch
 
 import numpy as np
@@ -38,7 +41,7 @@ from fluxvla.engines.runners.tron2_inference_runner import (
 from fluxvla.engines.runners.tron2_overlap_inference_runner import (
     Tron2OverlapInferenceRunner, )
 from fluxvla.engines.runners.tron2_remote_rtc_inference_runner import (
-    Tron2RemoteRTCInferenceRunner, )
+    Tron2RemoteRTCInferenceRunner, _TerminalKeyReader)
 
 ROOT = Path(__file__).resolve().parents[1]
 
@@ -60,7 +63,7 @@ def test_tron2_lora_config_deployment_defaults():
     assert inference['type'] == 'Tron2RemoteRTCInferenceRunner'
     assert inference['action_chunk'] == 50
     assert inference['execute_horizon'] == 10
-    assert inference['max_queue_empty_steps'] == 3
+    assert inference['hold_warning_interval_s'] == 1.0
     assert inference['rtc_config'] == {
         'enabled': True,
         'method': 'guidance',
@@ -90,17 +93,15 @@ def test_tron2_lora_config_deployment_defaults():
     assert operator['movej_duration'] == 2.0
     assert operator['servoj_publish_rate'] == 300.0
     assert operator['max_servoj_step_rad'] == 0.2
-    assert operator['max_state_source_mismatch_rad'] == 0.5
+    assert operator['max_state_source_mismatch_rad'] is None
     assert operator['lock_head'] is True
     assert operator['max_head_hold_error_rad'] == 0.05
 
 
 def test_all_tron2_configs_use_tron2_env_operator():
     config_paths = [
-        ROOT / 'configs' / 'pi05' /
-        'pi05_paligemma_tron2_full_finetune.py',
-        ROOT / 'configs' / 'pi05' /
-        'pi05_paligemma_tron2_lora_finetune.py',
+        ROOT / 'configs' / 'pi05' / 'pi05_paligemma_tron2_full_finetune.py',
+        ROOT / 'configs' / 'pi05' / 'pi05_paligemma_tron2_lora_finetune.py',
         ROOT / 'configs' / 'gr00t' /
         'gr00t_eagle_3b_tron2_3cam_full_finetune.py',
     ]
@@ -113,6 +114,7 @@ def test_all_tron2_configs_use_tron2_env_operator():
         assert 'joint_state_topic' not in operator
         assert operator['servoj_publish_rate'] == 300.0
         assert operator['max_servoj_step_rad'] == 0.2
+        assert operator['max_state_source_mismatch_rad'] is None
         assert operator['lock_head'] is True
 
 
@@ -211,8 +213,8 @@ def test_tron2_checkpoint_metadata_never_falls_back_to_robot_config(tmp_path):
         }
     })
 
-    with pytest.raises(FileNotFoundError,
-                       match='checkpoint-local task metadata'):
+    with pytest.raises(
+            FileNotFoundError, match='checkpoint-local task metadata'):
         load_deployment_metadata(cfg, str(checkpoint))
 
 
@@ -284,7 +286,7 @@ def test_overlap_episode_executes_one_horizon_per_requested_chunk():
     runner.blend_start_weight = 0.0
     runner.blend_end_weight = 1.0
     runner.queue_poll_interval_s = 0.0005
-    runner.max_queue_empty_steps = 10
+    runner.hold_warning_interval_s = 1.0
     runner.dt = 0.005
     runner._prev_ctx = None
     runner._action_ctx = None
@@ -305,24 +307,59 @@ def test_overlap_episode_executes_one_horizon_per_requested_chunk():
     assert len(executed) == 3 * runner.execute_horizon
 
 
-def test_overlap_consumer_reports_queue_underrun():
-    runner = Tron2OverlapInferenceRunner.__new__(
-        Tron2OverlapInferenceRunner)
-    runner.max_queue_empty_steps = 0
+def test_overlap_consumer_holds_on_queue_underrun(caplog):
+    caplog.set_level(30)
+    runner = Tron2OverlapInferenceRunner.__new__(Tron2OverlapInferenceRunner)
     runner.dt = 0.001
+    runner.hold_warning_interval_s = 0.005
     errors = []
     shutdown_event = threading.Event()
+    consumer = threading.Thread(
+        target=runner._consume_actions,
+        args=(ActionQueue(rtc_enabled=True), threading.Event(), shutdown_event,
+              errors),
+    )
+
+    consumer.start()
+    time.sleep(0.015)
+    assert consumer.is_alive()
+    assert not errors
+    shutdown_event.set()
+    consumer.join(timeout=1.0)
+
+    assert not consumer.is_alive()
+    assert not errors
+    assert any('[Hold]' in record.message for record in caplog.records)
+
+
+def test_overlap_consumer_skips_rejected_waypoint_and_continues():
+    runner = Tron2OverlapInferenceRunner.__new__(Tron2OverlapInferenceRunner)
+    runner.dt = 0.001
+    runner.hold_warning_interval_s = 1.0
+    attempts = []
+
+    def execute(action):
+        attempts.append(action.copy())
+        if len(attempts) == 1:
+            raise ValueError('test rejection')
+
+    runner._execute_waypoint = execute
+    action_queue = ActionQueue(rtc_enabled=True)
+    actions = np.zeros((2, 16), dtype=np.float32)
+    action_queue.merge(actions, actions, real_delay=0)
+    producer_done = threading.Event()
+    producer_done.set()
+    errors = []
 
     runner._consume_actions(
-        ActionQueue(rtc_enabled=True),
+        action_queue,
+        producer_done,
         threading.Event(),
-        shutdown_event,
         errors,
     )
 
-    assert shutdown_event.is_set()
-    assert len(errors) == 1
-    assert 'queue underrun' in str(errors[0])
+    assert len(attempts) == 2
+    assert not errors
 
 
 def test_remote_rtc_msgpack_request_round_trip():
@@ -517,16 +554,93 @@ def test_remote_rtc_runner_builds_dynamic_guidance_payload():
     assert payload['prefix_len'] == 8
     assert payload['config']['decay_end'] == 13
     np.testing.assert_array_equal(payload['prev_actions'], raw_left_over)
+    assert runner._resolve_hold_delay(12, 9, queue_empty=True) == 3
+    assert runner._resolve_hold_delay(12, 9, queue_empty=False) == 0
+    assert runner._resolve_prefix_len(np.empty((0, 16))) == 0
 
 
-def test_remote_rtc_episode_keeps_raw_prefix_and_executes_processed_actions():
+class _FakeKeyReader:
+
+    def __init__(self, keys):
+        self._keys = list(keys)
+        self._lock = threading.Lock()
+
+    def get_key(self, timeout=None):
+        del timeout
+        with self._lock:
+            if self._keys:
+                return self._keys.pop(0)
+        time.sleep(0.001)
+        return None
+
+
+def test_remote_rtc_terminal_reader_reads_one_key_and_restores_tty():
+    master_fd, slave_fd = pty.openpty()
+    saved_attributes = termios.tcgetattr(slave_fd)
+    try:
+        with os.fdopen(os.dup(slave_fd), 'r', encoding='utf-8') as stream:
+            with _TerminalKeyReader(stream) as key_reader:
+                os.write(master_fd, b's')
+                assert key_reader.get_key(timeout=1.0) == 's'
+        assert termios.tcgetattr(slave_fd) == saved_attributes
+    finally:
+        os.close(master_fd)
+        os.close(slave_fd)
+
+
+def test_remote_rtc_idle_keys_require_task_confirmation_before_start():
+    runner = Tron2RemoteRTCInferenceRunner.__new__(
+        Tron2RemoteRTCInferenceRunner)
+    runner.task_descriptions = {'2': 'put both dolls in the pink basket'}
+
+    command, task_id = runner._wait_for_idle_command(
+        _FakeKeyReader(['b', '2', 'b', '\n', 'b']))
+
+    assert command == 'start'
+    assert task_id == '2'
+
+
+def test_remote_rtc_idle_r_requests_prepare_pose_without_task():
+    runner = Tron2RemoteRTCInferenceRunner.__new__(
+        Tron2RemoteRTCInferenceRunner)
+
+    assert runner._wait_for_idle_command(_FakeKeyReader(['r'])) == ('prepare',
+                                                                    None)
+
+
+def test_remote_rtc_active_keys_only_allow_stop(caplog):
+    caplog.set_level(20)
+    runner = Tron2RemoteRTCInferenceRunner.__new__(
+        Tron2RemoteRTCInferenceRunner)
+    runner._chunk_accept_lock = threading.Lock()
+    stop_requested = threading.Event()
+    monitor_done = threading.Event()
+    monitor_errors = []
+    monitor = threading.Thread(
+        target=runner._monitor_active_keys,
+        args=(_FakeKeyReader(['r', 'b', 's']), stop_requested, monitor_done,
+              monitor_errors),
+    )
+
+    monitor.start()
+    assert stop_requested.wait(timeout=1.0)
+    monitor_done.set()
+    monitor.join(timeout=1.0)
+
+    assert not monitor.is_alive()
+    assert not monitor_errors
+    assert any('r is ignored while running' in record.message
+               for record in caplog.records)
+
+
+def test_remote_rtc_episode_stops_new_inference_and_drains_accepted_actions():
     runner = Tron2RemoteRTCInferenceRunner.__new__(
         Tron2RemoteRTCInferenceRunner)
     runner.action_layout = 'tron2_16'
     runner.action_chunk = 4
     runner.execute_horizon = 2
     runner.queue_poll_interval_s = 0.0005
-    runner.max_queue_empty_steps = 10
+    runner.hold_warning_interval_s = 1.0
     runner.dt = 0.02
     runner.rtc_prefix_len = 1
     runner.rtc_latency_margin_frames = 0
@@ -537,6 +651,7 @@ def test_remote_rtc_episode_keeps_raw_prefix_and_executes_processed_actions():
     runner._last_e2e_latency_s = None
     runner._prev_ctx = None
     runner._action_ctx = None
+    runner._chunk_accept_lock = threading.Lock()
 
     raw_chunks = [
         np.repeat(np.arange(4, dtype=np.float32)[:, None], 16, axis=1),
@@ -546,24 +661,60 @@ def test_remote_rtc_episode_keeps_raw_prefix_and_executes_processed_actions():
     processed_chunks = [chunk + 100.0 for chunk in raw_chunks]
     requests = []
     executed = []
-    runner._get_user_task_instruction = lambda _: ['task'] * 3
     runner._preprocess = lambda _: {'unnorm_key': 'private'}
+    stop_requested = threading.Event()
 
     def request_pair(inputs, rtc=None):
+        del inputs
         requests.append(rtc)
+        if len(requests) == 3:
+            stop_requested.set()
         return raw_chunks.pop(0), processed_chunks.pop(0), 0.001
 
     runner._request_action_pair = request_pair
     runner._execute_waypoint = lambda action: executed.append(action.copy())
 
-    runner._run_episode('unused')
+    runner._run_continuous_episode('task', stop_requested)
 
-    assert len(executed) == 3 * runner.execute_horizon
+    assert len(requests) == 3
+    assert executed
     assert all(float(action[0]) >= 100.0 for action in executed)
+    assert all(float(action[0]) < 120.0 for action in executed)
     assert requests[0] is None
     assert len(requests[1]['prev_actions']) >= runner.execute_horizon
     assert requests[1]['prev_actions'][0, 0] >= 2.0
     assert requests[1]['config']['method'] == 'guidance'
+    assert requests[2] is not None
+
+
+def test_remote_rtc_stop_during_first_inference_sends_no_actions():
+    runner = Tron2RemoteRTCInferenceRunner.__new__(
+        Tron2RemoteRTCInferenceRunner)
+    runner.action_layout = 'tron2_16'
+    runner.action_chunk = 4
+    runner.execute_horizon = 2
+    runner.queue_poll_interval_s = 0.0005
+    runner.hold_warning_interval_s = 1.0
+    runner.dt = 0.005
+    runner._prev_ctx = None
+    runner._action_ctx = None
+    runner._chunk_accept_lock = threading.Lock()
+    stop_requested = threading.Event()
+    executed = []
+    chunk = np.zeros((4, 16), dtype=np.float32)
+    runner._preprocess = lambda _: {}
+
+    def request_pair(inputs, rtc=None):
+        del inputs, rtc
+        stop_requested.set()
+        return chunk, chunk, 0.001
+
+    runner._request_action_pair = request_pair
+    runner._execute_waypoint = lambda action: executed.append(action.copy())
+
+    runner._run_continuous_episode('task', stop_requested)
+
+    assert not executed
 
 
 def test_tron2_runner_requires_explicit_checkpoint_task_id():

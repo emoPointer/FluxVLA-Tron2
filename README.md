@@ -314,7 +314,7 @@ operator=dict(
     movej_duration=2.0,
     servoj_publish_rate=300.0,
     max_servoj_step_rad=0.2,
-    max_state_source_mismatch_rad=0.5,
+    max_state_source_mismatch_rad=None,
     lock_head=True,
     max_head_hold_error_rad=0.05,
 )
@@ -549,17 +549,19 @@ If the server is reachable only through port 22, keep this SSH tunnel mode.
 If SSH key login is configured, the command will not ask for a password.
 
 During dry run, the client first prints the task IDs advertised by the active
-checkpoint. Enter task ID `0` to use the prepare-pose flow, then enter one of
-those advertised task IDs:
+checkpoint and then enters the robot-side keyboard state machine:
 
 ```text
-Enter task ID (0 = prepare pose): 0
-Enter task ID after prepare pose: 6
-Number of times to repeat the task: 1
+[TRON2 client idle] Type task ID and press Enter. b=start, r=prepare pose, Ctrl+C=exit.
+Task ID: 6
+Selected task 6: Fold the clothes
+Press b to start, or type another task ID and press Enter.
 ```
 
-In dry-run mode, the prepare-pose command is not executed; this only verifies
-the interaction flow before real execution.
+Press `b` to start continuous inference and `s` to stop requesting/accepting
+new chunks. Press `r` while idle to run the same prepare-pose path previously
+selected by task ID `0`. In dry-run mode, prepare-pose execution is skipped;
+this only verifies the interaction flow before real execution.
 
 Expected dry-run output includes the remote RTC timing configuration. Dry run
 still consumes the simulated action queue at 30 Hz, but never opens the robot
@@ -582,25 +584,7 @@ Only run real execution after:
 - WebSocket handshake succeeds;
 - a physical emergency stop is available.
 
-Start with a short execution horizon:
-
-```bash
-bash scripts/remote_inference_client.sh \
-  configs/pi05/pi05_paligemma_tron2_lora_finetune.py \
-  --ssh-host USER@SERVER_PUBLIC_IP \
-  --ssh-port 22 \
-  --local-port 5555 \
-  --remote-port 3333 \
-  --cfg-options inference.dry_run=False inference.execute_horizon=4
-```
-
-With a repeat count of 1, `inference.execute_horizon=4` limits the first real
-test to four 30 Hz policy frames. Use this override only for the single-repeat
-commissioning test. For continuous RTC, first validate end-to-end inference
-latency and prefix diagnostics in dry run.
-
-After the behavior is verified, remove the override to use the default
-10-frame inference trigger:
+Start the client with the normal RTC timing:
 
 ```bash
 bash scripts/remote_inference_client.sh \
@@ -612,12 +596,20 @@ bash scripts/remote_inference_client.sh \
   --cfg-options inference.dry_run=False
 ```
 
+Select and confirm a task ID, then press `b`. There is no repeat count: the
+client keeps requesting chunks until `s` is pressed. `execute_horizon` controls
+when the next inference request starts; it is not an execution-length limit.
+Pressing `s` prevents any later request or in-flight result from being accepted,
+then drains the action chunk already accepted by the client before reporting
+idle. Select a task ID again before the next `b`.
+
 The default deployment uses stateless server-side guidance RTC:
 
 ```python
 type='Tron2RemoteRTCInferenceRunner'
 action_chunk=50
 execute_horizon=10
+hold_warning_interval_s=1.0
 rtc_config=dict(
     enabled=True,
     method='guidance',
@@ -639,6 +631,21 @@ denormalized executable chunk. The client replaces its paired queues after
 discarding the number of frames actually consumed in flight. No Torch/model
 code and no numerical chunk cross-fade run on the PCM.
 
+The single-key reader and `b`/`s`/`r` state machine run only on the robot PCM;
+the GPU service receives ordinary stateless prediction requests and has no
+keyboard-control state. While running or draining, `r` is ignored. To return to
+the prepare pose, press `s`, wait for the client to report idle, and then press
+`r`.
+
+If the action queue becomes empty, or a waypoint is rejected by the retained
+step-delta, head-lock, or data-integrity checks, the client sends no replacement
+command. The persistent MotionController therefore keeps its last accepted
+ServoJ target. A `[Hold]` warning is printed at most once per second and the
+client continues. Wall-clock frames spent holding are included when aligning
+the next RTC chunk.
+If the raw reserve is completely exhausted, one unguided recovery chunk is
+requested instead of terminating; guidance resumes once a remainder exists.
+
 When `prefix_len=None`, the guided prefix is
 `ceil(previous_end_to_end_latency / policy_dt) + latency_margin_frames`, capped
 by the available old plan. The current checkpoint was not trained with RTC
@@ -647,22 +654,24 @@ prefix conditioning, so this deployment deliberately uses inference-only
 
 ## 11. Move to the Prepare Pose
 
-During runtime interaction, enter task ID `0` to move the robot to the
-configured prepare pose:
+While the client is idle, press `r` to run the same prepare-pose logic as the
+old task-ID-`0` path:
 
 ```text
-Enter task ID (0 = prepare pose): 0
-Enter task ID after prepare pose: 6
-Number of times to repeat the task: 1
+[TRON2 client idle] Type task ID and press Enter. b=start, r=prepare pose, Ctrl+C=exit.
+# press r
+Prepare-pose sequence completed. Select a task ID, then press b.
 ```
 
 In dry-run mode, prepare-pose execution is skipped.  In real execution mode,
-each prepare pose uses MoveJ and does not send a head target. Before the first
-policy action, the full chunk is checked against both Bridge and control
-feedback before a fresh `tron2_env` MotionController may stream ServoJ at
-300 Hz. Policy head trajectories are rejected and the measured head position
-is held. If prepare is requested again, the ServoJ publisher is disconnected
+each prepare pose uses MoveJ and does not send a head target. Before each policy
+waypoint, live control feedback, action shape/finite values, head lock, and the
+`0.2`-rad ServoJ delta are checked. Bridge/control source mismatch blocking is
+disabled. Rejected waypoints hold the previous target instead of terminating
+the client. If prepare is requested again, the ServoJ publisher is disconnected
 before any new MoveJ command is sent.
+`r` is rejected while inference or accepted-queue draining is active; first
+press `s` and wait for the idle message.
 
 ## 12. Important Safety Notes
 
@@ -674,7 +683,8 @@ by the Tron2 controller is canceled.
 For first deployment on a new robot:
 
 - keep one operator near the physical emergency stop;
-- use `inference.execute_horizon=4` with repeat count 1;
+- validate the `b`/`s` flow in dry run and remember that an already accepted
+  50-frame chunk is drained after `s`;
 - keep object placement conservative;
 - verify gripper open/close convention before full-speed runs;
 - keep `max_servoj_step_rad=0.2` until recorded trajectories justify a tighter
@@ -766,10 +776,11 @@ The most important runtime switches are:
 | `inference.dry_run=True`      | full inference flow, no robot action     |
 | `inference.dry_run=False`     | execute returned actions on the robot    |
 | `inference.execute_horizon=10` | nominal frames between remote RTC requests; remaining chunk is latency reserve |
+| `inference.hold_warning_interval_s=1.0` | warning interval while holding the last target |
 | `inference.rtc_config.prefix_len=None` | size guidance prefix from previous end-to-end latency |
 | `inference.operator.ws_port`  | Tron2 WebSocket controller port          |
 | `inference.operator.servoj_publish_rate` | ServoJ background rate (300 Hz) |
 | `inference.operator.max_servoj_step_rad` | Per-waypoint delta guard (rad) |
-| `inference.operator.max_state_source_mismatch_rad` | Bridge/control feedback mismatch guard (rad) |
+| `inference.operator.max_state_source_mismatch_rad=None` | disable Bridge/control mismatch blocking |
 | `inference.operator.lock_head` | reject policy head targets and hold measured head |
 | `inference.operator.max_head_hold_error_rad` | block ServoJ if the measured head drifts (rad) |

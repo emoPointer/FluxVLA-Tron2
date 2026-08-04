@@ -158,6 +158,24 @@ new frames corresponding to actual queue consumption during the request and
 atomically installs the remaining pair. The protocol is stateless; the server
 does not retain per-robot previous actions.
 
+An exhausted client queue no longer terminates the episode. The client issues
+no new command, so MotionController holds its last accepted ServoJ target and
+prints a rate-limited `[Hold]` warning. The same behavior applies when a
+waypoint is rejected by the retained delta, head-lock, or data-integrity
+checks. Wall-clock frames spent holding are added to the merge delay so the
+next returned chunk is not treated as newer than it is.
+If no raw prefix remains at all, the client requests one unguided recovery
+chunk instead of terminating, then resumes guidance once a remainder exists.
+
+The robot PCM owns a local single-key state machine for continuous RTC. After
+selecting and confirming a task ID, `b` starts inference and `s` stops future
+requests/chunk acceptance. If `s` arrives during a GPU request, that result is
+discarded; the action queue accepted before `s` is still drained. Once the
+client reports idle, a task ID must be selected again before `b`. The `r` key
+runs the former task-ID-`0` MoveJ prepare-pose path only while idle and is
+ignored while running or draining. None of this keyboard state is sent to or
+stored by the GPU service.
+
 The TRON2 PI0.5 LoRA deployment uses a 50-frame action chunk, a 10-frame nominal
 execution horizon, and a 40-frame latency reserve. With `prefix_len=None`, the
 client estimates the next guidance prefix from the previous end-to-end request

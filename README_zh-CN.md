@@ -285,7 +285,7 @@ operator=dict(
     movej_duration=2.0,
     servoj_publish_rate=300.0,
     max_servoj_step_rad=0.2,
-    max_state_source_mismatch_rad=0.5,
+    max_state_source_mismatch_rad=None,
     lock_head=True,
     max_head_hold_error_rad=0.05,
 )
@@ -505,16 +505,18 @@ bash scripts/remote_inference_client.sh \
 如果服务器只能通过 22 端口访问，保留 SSH tunnel 模式。若已配置 SSH key，
 运行时不会再要求输入密码。
 
-dry run 启动时会先显示当前权重登记的任务 ID。输入 task ID `0` 验证
-prepare-pose 交互流程，然后输入其中一个已登记的任务 ID：
+dry run 启动时会先显示当前权重登记的任务 ID，随后进入机器人端键盘状态机：
 
 ```text
-Enter task ID (0 = prepare pose): 0
-Enter task ID after prepare pose: 6
-Number of times to repeat the task: 1
+[TRON2 client idle] Type task ID and press Enter. b=start, r=prepare pose, Ctrl+C=exit.
+Task ID: 6
+Selected task 6: Fold the clothes
+Press b to start, or type another task ID and press Enter.
 ```
 
-dry run 不会真正执行 prepare pose，只验证真实执行前的交互流程。
+按 `b` 开始连续推理，按 `s` 停止请求/接收新的 chunk。空闲状态按 `r` 会执行
+原 task ID `0` 对应的 prepare-pose 逻辑。dry run 不会真正执行 prepare pose，
+只验证真实执行前的交互流程。
 
 dry run 仍会按 30 Hz 消费模拟动作队列，但不会连接机器人控制接口。预期日志包括：
 
@@ -534,23 +536,7 @@ GPU 服务端必须运行与客户端一致的新代码。旧服务端既不会�
 - WebSocket 连接稳定；
 - 现场有物理急停。
 
-首次部署建议使用较短的执行 horizon：
-
-```bash
-bash scripts/remote_inference_client.sh \
-  configs/pi05/pi05_paligemma_tron2_lora_finetune.py \
-  --ssh-host USER@SERVER_PUBLIC_IP \
-  --ssh-port 22 \
-  --local-port 5555 \
-  --remote-port 3333 \
-  --cfg-options inference.dry_run=False inference.execute_horizon=4
-```
-
-repeat count 为 1 时，`inference.execute_horizon=4` 会把第一次真机测试限制为
-4 个 30 Hz policy 帧。该覆盖项只用于单次 commissioning 测试。连续 RTC 前，
-必须先在 dry run 中检查端到端推理延迟和 prefix 日志。
-
-确认行为稳定后，可以去掉该覆盖项，使用默认的 10 帧推理触发间隔：
+使用正常的 RTC 时序启动客户端：
 
 ```bash
 bash scripts/remote_inference_client.sh \
@@ -562,12 +548,19 @@ bash scripts/remote_inference_client.sh \
   --cfg-options inference.dry_run=False
 ```
 
+选择并确认 task ID 后按 `b`。现在没有 repeat count：客户端会持续请求 chunk，
+直到按下 `s`。`execute_horizon` 只控制下一次推理何时触发，不限制总执行长度。
+按 `s` 后不会再发起新请求，也不会接收按键期间仍在推理的返回 chunk；客户端会
+继续排空此前已经接收的动作 chunk，之后才报告空闲。再次按 `b` 前必须重新选择
+task ID。
+
 当前配置使用无状态的服务端 guidance RTC：
 
 ```python
 type='Tron2RemoteRTCInferenceRunner'
 action_chunk=50
 execute_horizon=10
+hold_warning_interval_s=1.0
 rtc_config=dict(
     enabled=True,
     method='guidance',
@@ -586,26 +579,38 @@ raw plan。GPU 服务器运行 FluxVLA 原版 inference-time guidance RTC，同�
 归一化 raw chunk 和反归一化可执行 chunk。客户端根据推理期间实际消费的帧数替换
 两条成对队列。PCM 不运行 Torch/模型，也不再对两个 chunk 做数值 cross-fade。
 
+单键读取和 `b`/`s`/`r` 状态机只运行在机器人 PCM 上；GPU 服务端仍然只接收
+无状态推理请求，不保存任何键盘控制状态。运行或排空动作队列期间按 `r` 会被忽略。
+需要回到 prepare pose 时，先按 `s`，等待客户端报告 idle，再按 `r`。
+
 当 `prefix_len=None` 时，prefix 长度为
 `ceil(上一次端到端延迟 / policy_dt) + latency_margin_frames`，并受剩余旧计划长度
 限制。当前权重没有使用 RTC prefix conditioning 训练，因此这里明确采用仅推理时
 的 `method='guidance'`，而不是 `method='prefix'`。
 
+如果动作队列暂时为空，或者路点被保留的相邻跳变、头部锁定、数据完整性检查拒绝，
+客户端不会发送替代目标。持续运行的 MotionController 会保持最后一个已接受的
+ServoJ 目标；程序最多每秒打印一次 `[Hold]` warning，并继续等待后续动作。保持期间
+经过的墙钟帧数会计入下一次 RTC chunk 的延迟对齐。
+如果 raw 余量已经完全耗尽，客户端会请求一个无 guidance 的恢复 chunk，而不是
+退出；重新获得余量后继续使用 guidance。
+
 ## 11. 进入初始位姿
 
-运行交互中输入 task ID `0`，机器人会进入配置好的 prepare pose：
+客户端空闲时按 `r`，会运行旧 task ID `0` 对应的 prepare-pose 逻辑：
 
 ```text
-Enter task ID (0 = prepare pose): 0
-Enter task ID after prepare pose: 6
-Number of times to repeat the task: 1
+[TRON2 client idle] Type task ID and press Enter. b=start, r=prepare pose, Ctrl+C=exit.
+# press r
+Prepare-pose sequence completed. Select a task ID, then press b.
 ```
 
 dry run 下不会执行 prepare pose。真实执行模式下，每个 prepare pose 使用 MoveJ，
-且不发送头部目标。第一次策略动作前，会先用 Bridge 与控制 WebSocket 的反馈校验
-整个动作段，校验通过后才允许新建 `tron2_env` MotionController 并以 300 Hz
-发布 ServoJ。策略头部轨迹会被拒绝，控制器只保持启动时的实测头部位置；再次请求
-prepare 时，会先断开 ServoJ 发布器，之后才发送新的 MoveJ。
+且不发送头部目标。每个策略路点会检查实时控制反馈、动作维度/有限值、头部锁定和
+`0.2`-rad ServoJ 相邻跳变；Bridge/控制状态源差异阻断已关闭。被拒绝的路点保持
+上一目标，不再终止客户端；再次请求 prepare 时，会先断开 ServoJ 发布器，之后才
+发送新的 MoveJ。
+推理运行或已接收动作仍在排空时，`r` 不会执行；必须先按 `s` 并等待 idle 日志。
 
 ## 12. 安全提醒
 
@@ -616,7 +621,8 @@ WebSocket，但它仍然不是机器人急停：不会自动卸力，也不能�
 新机器人首次部署时：
 
 - 操作员应在物理急停旁；
-- 使用 `inference.execute_horizon=4`，并将 repeat count 设为 1；
+- 先在 dry run 中验证 `b`/`s` 流程，并注意按 `s` 后仍会排空已经接收的
+  50 帧 chunk；
 - 物体摆放保守；
 - 完整运行前先确认夹爪开合约定；
 - 在有实测轨迹支持更严格阈值前，保持 `max_servoj_step_rad=0.2`。
@@ -703,10 +709,11 @@ scripts/remote_inference_client.sh
 | `inference.dry_run=True`      | 完成推理链路，但不执行机器人动作 |
 | `inference.dry_run=False`     | 在机器人上执行返回动作           |
 | `inference.execute_horizon=10` | 远程 RTC 请求的名义间隔；chunk 其余部分作为延迟余量 |
+| `inference.hold_warning_interval_s=1.0` | 保持最后目标时的 warning 输出间隔 |
 | `inference.rtc_config.prefix_len=None` | 根据上一次端到端延迟动态确定 guidance prefix |
 | `inference.operator.ws_port`  | Tron2 WebSocket 控制端口         |
 | `inference.operator.servoj_publish_rate` | ServoJ 后台发布频率（300 Hz） |
 | `inference.operator.max_servoj_step_rad` | 相邻路点变化上限（rad） |
-| `inference.operator.max_state_source_mismatch_rad` | Bridge/控制反馈差异上限（rad） |
+| `inference.operator.max_state_source_mismatch_rad=None` | 关闭 Bridge/控制反馈差异阻断 |
 | `inference.operator.lock_head` | 拒绝策略头部目标并保持实测头部位置 |
 | `inference.operator.max_head_hold_error_rad` | 实测头部漂移时阻止 ServoJ（rad） |

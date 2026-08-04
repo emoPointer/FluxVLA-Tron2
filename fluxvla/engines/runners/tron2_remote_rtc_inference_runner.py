@@ -25,8 +25,14 @@ from __future__ import annotations
 
 import io
 import math
+import os
+import queue
+import select
+import sys
+import termios
 import threading
 import time
+import tty
 from types import SimpleNamespace
 
 import numpy as np
@@ -35,6 +41,74 @@ from tron2_env.rtc import ActionQueue
 from ..utils import initialize_overwatch
 from ..utils.root import RUNNERS
 from .tron2_overlap_inference_runner import Tron2OverlapInferenceRunner
+
+
+class _TerminalKeyReader:
+    """Read single client-side keys while preserving terminal state."""
+
+    def __init__(self, input_stream=None):
+        self._input_stream = sys.stdin if input_stream is None else input_stream
+        self._fd = None
+        self._saved_attributes = None
+        self._keys = queue.Queue()
+        self._stop_event = threading.Event()
+        self._reader_error = None
+        self._reader_thread = None
+
+    def __enter__(self):
+        try:
+            self._fd = self._input_stream.fileno()
+        except (AttributeError, OSError) as exc:
+            raise RuntimeError('TRON2 keyboard control requires a terminal '
+                               'stdin with a file descriptor.') from exc
+        if not os.isatty(self._fd):
+            raise RuntimeError(
+                'TRON2 keyboard control requires an interactive TTY. Run the '
+                'remote client in a foreground terminal.')
+
+        self._saved_attributes = termios.tcgetattr(self._fd)
+        tty.setcbreak(self._fd)
+        self._reader_thread = threading.Thread(
+            target=self._read_keys,
+            daemon=True,
+            name='Tron2-client-key-reader',
+        )
+        self._reader_thread.start()
+        return self
+
+    def _read_keys(self):
+        try:
+            while not self._stop_event.is_set():
+                readable, _, _ = select.select([self._fd], [], [], 0.1)
+                if not readable:
+                    continue
+                data = os.read(self._fd, 1)
+                if not data:
+                    raise EOFError('TRON2 client terminal input closed.')
+                self._keys.put(data.decode('utf-8', errors='ignore'))
+        except BaseException as exc:
+            if not self._stop_event.is_set():
+                self._reader_error = exc
+                self._keys.put(None)
+
+    def get_key(self, timeout=None):
+        try:
+            key = self._keys.get(timeout=timeout)
+        except queue.Empty:
+            return None
+        if key is None and self._reader_error is not None:
+            raise RuntimeError('TRON2 client key reader failed.') from \
+                self._reader_error
+        return key
+
+    def __exit__(self, exc_type, exc_value, traceback):
+        del exc_type, exc_value, traceback
+        self._stop_event.set()
+        if self._reader_thread is not None:
+            self._reader_thread.join(timeout=1.0)
+        if self._saved_attributes is not None:
+            termios.tcsetattr(self._fd, termios.TCSADRAIN,
+                              self._saved_attributes)
 
 
 @RUNNERS.register_module()
@@ -104,6 +178,7 @@ class Tron2RemoteRTCInferenceRunner(Tron2OverlapInferenceRunner):
         self.rtc_max_guidance_weight = float(max_guidance_weight)
         self.rtc_use_vjp = use_vjp
         self._last_e2e_latency_s = None
+        self._chunk_accept_lock = threading.Lock()
 
         super().__init__(*args, **kwargs)
         if not self._use_remote:
@@ -134,8 +209,7 @@ class Tron2RemoteRTCInferenceRunner(Tron2OverlapInferenceRunner):
 
     def _resolve_prefix_len(self, raw_left_over: np.ndarray) -> int:
         if raw_left_over is None or len(raw_left_over) == 0:
-            raise RuntimeError('Remote RTC requires an unconsumed raw action '
-                               'prefix, but the action queue is empty.')
+            return 0
         if self.rtc_prefix_len is None:
             if self._last_e2e_latency_s is None:
                 raise RuntimeError('Remote RTC has no previous latency sample '
@@ -163,6 +237,14 @@ class Tron2RemoteRTCInferenceRunner(Tron2OverlapInferenceRunner):
             },
         }
 
+    @staticmethod
+    def _resolve_hold_delay(measured_delay: int, observed_delay: int,
+                            queue_empty: bool) -> int:
+        """Account for wall-clock frames spent holding an exhausted queue."""
+        if not queue_empty:
+            return 0
+        return max(0, int(measured_delay) - int(observed_delay))
+
     def _request_action_pair(
             self,
             inputs: dict,
@@ -181,11 +263,139 @@ class Tron2RemoteRTCInferenceRunner(Tron2OverlapInferenceRunner):
                 f'{processed_actions.shape}.')
         return raw_actions, processed_actions, elapsed
 
-    def _run_episode(self, default_instruction: str):
-        """Run one episode with server-side guidance and paired action queues."""
+    def _wait_for_idle_command(self, key_reader):
+        """Select a checkpoint task, start it, or request the prepare pose."""
         overwatch = initialize_overwatch(__name__)
-        instructions = self._get_user_task_instruction(default_instruction)
-        if not instructions:
+        task_buffer = ''
+        selected_task_id = None
+        print('\n[TRON2 client idle] Type task ID and press Enter. '
+              'b=start, r=prepare pose, Ctrl+C=exit.')
+        print('Task ID: ', end='', flush=True)
+
+        while True:
+            key = key_reader.get_key(timeout=0.1)
+            if key is None:
+                continue
+            command = key.lower()
+
+            if key.isdigit():
+                if selected_task_id is not None:
+                    selected_task_id = None
+                    task_buffer = ''
+                    print('\nTask ID: ', end='', flush=True)
+                task_buffer += key
+                print(key, end='', flush=True)
+                continue
+            if key in {'\x7f', '\b'}:
+                if task_buffer:
+                    task_buffer = task_buffer[:-1]
+                    print('\b \b', end='', flush=True)
+                continue
+            if key in {'\r', '\n'}:
+                print()
+                if not task_buffer:
+                    print('Task ID: ', end='', flush=True)
+                    continue
+                if task_buffer == '0':
+                    overwatch.warning(
+                        'Task ID 0 is the prepare-pose command; press r while '
+                        'the client is idle.')
+                    task_buffer = ''
+                    print('Task ID: ', end='', flush=True)
+                    continue
+                try:
+                    description = self._get_task_description(task_buffer)
+                except ValueError as exc:
+                    overwatch.warning('%s', exc)
+                    task_buffer = ''
+                    print('Task ID: ', end='', flush=True)
+                    continue
+                selected_task_id = task_buffer
+                task_buffer = ''
+                overwatch.info('Selected task %s: %s', selected_task_id,
+                               description)
+                print('Press b to start, or type another task ID and press '
+                      'Enter.')
+                continue
+            if command == 'b':
+                if task_buffer:
+                    overwatch.warning(
+                        'Press Enter to confirm task ID %s before starting.',
+                        task_buffer)
+                    continue
+                if selected_task_id is None:
+                    overwatch.warning('Select a task ID before pressing b.')
+                    continue
+                return 'start', selected_task_id
+            if command == 'r':
+                return 'prepare', None
+            if command == 's':
+                overwatch.info('Inference is already stopped; no action is '
+                               'being generated or sent.')
+                continue
+            if key not in {' ', '\t'}:
+                overwatch.warning(
+                    'Unknown idle key %r. Use task ID + Enter, '
+                    'b, or r.', key)
+
+    def _monitor_active_keys(self, key_reader, stop_requested: threading.Event,
+                             monitor_done: threading.Event,
+                             monitor_errors: list[BaseException]):
+        """Accept only ``s`` while inference or queue draining is active."""
+        overwatch = initialize_overwatch(__name__)
+        try:
+            while not monitor_done.is_set():
+                key = key_reader.get_key(timeout=0.1)
+                if key is None:
+                    continue
+                command = key.lower()
+                if command == 's':
+                    with self._chunk_accept_lock:
+                        already_stopping = stop_requested.is_set()
+                        stop_requested.set()
+                    if already_stopping:
+                        overwatch.info('Stop is already pending; waiting for '
+                                       'the accepted action queue to finish.')
+                    else:
+                        overwatch.info(
+                            'Stop requested: no further inference request or '
+                            'action chunk will be accepted; draining the '
+                            'current action queue.')
+                elif command == 'r':
+                    overwatch.warning(
+                        'r is ignored while running or draining. Press s, '
+                        'wait for the client to report idle, then press r.')
+                elif command == 'b':
+                    overwatch.info('Inference is already running. Press s to '
+                                   'stop after the accepted queue finishes.')
+                elif key not in {'\r', '\n', ' ', '\t'}:
+                    overwatch.warning(
+                        'Key %r is ignored while inference is '
+                        'running; only s is active.', key)
+        except BaseException as exc:
+            monitor_errors.append(exc)
+            with self._chunk_accept_lock:
+                stop_requested.set()
+
+    def _wait_for_trigger_or_stop(self, action_queue: ActionQueue,
+                                  trigger_queue_size: int,
+                                  shutdown_event: threading.Event,
+                                  consumer_errors: list[BaseException],
+                                  stop_requested: threading.Event) -> bool:
+        while action_queue.qsize() > trigger_queue_size:
+            self._raise_consumer_error(consumer_errors)
+            if stop_requested.wait(self.queue_poll_interval_s):
+                return False
+            if shutdown_event.is_set():
+                self._raise_consumer_error(consumer_errors)
+                raise RuntimeError('Remote RTC action consumer stopped.')
+        return not stop_requested.is_set()
+
+    def _run_continuous_episode(self, instruction: str,
+                                stop_requested: threading.Event):
+        """Infer continuously until stopped, then drain the accepted queue."""
+        overwatch = initialize_overwatch(__name__)
+        if stop_requested.is_set():
             return
 
         action_queue = ActionQueue(rtc_enabled=True)
@@ -195,19 +405,24 @@ class Tron2RemoteRTCInferenceRunner(Tron2OverlapInferenceRunner):
         consumer_thread = None
 
         try:
-            self._action_ctx = SimpleNamespace(instruction=instructions[0])
-            first_inputs = self._preprocess(instructions[0])
+            self._action_ctx = SimpleNamespace(instruction=instruction)
+            first_inputs = self._preprocess(instruction)
+            if stop_requested.is_set():
+                return
             first_raw, first_processed, first_elapsed = (
                 self._request_action_pair(first_inputs))
-            self._last_e2e_latency_s = first_elapsed
-            initial_length = (
-                self.action_chunk
-                if len(instructions) > 1 else self.execute_horizon)
-            action_queue.merge(
-                first_raw[:initial_length],
-                first_processed[:initial_length],
-                real_delay=0,
-            )
+            with self._chunk_accept_lock:
+                if stop_requested.is_set():
+                    overwatch.info(
+                        'Discarding the first inference result because s was '
+                        'pressed before it was accepted.')
+                    return
+                self._last_e2e_latency_s = first_elapsed
+                action_queue.merge(
+                    first_raw[:self.action_chunk],
+                    first_processed[:self.action_chunk],
+                    real_delay=0,
+                )
             self._prev_ctx = self._action_ctx
 
             consumer_thread = threading.Thread(
@@ -229,65 +444,91 @@ class Tron2RemoteRTCInferenceRunner(Tron2OverlapInferenceRunner):
                 first_elapsed * 1000.0,
             )
 
-            for chunk_index, instruction in enumerate(instructions[1:], 2):
-                self._wait_for_inference_trigger(
-                    action_queue,
-                    trigger_queue_size,
-                    shutdown_event,
-                    consumer_errors,
-                )
+            chunk_index = 1
+            while not stop_requested.is_set():
+                if not self._wait_for_trigger_or_stop(
+                        action_queue,
+                        trigger_queue_size,
+                        shutdown_event,
+                        consumer_errors,
+                        stop_requested,
+                ):
+                    break
 
                 self._action_ctx = SimpleNamespace(instruction=instruction)
                 inputs = self._preprocess(instruction)
                 self._raise_consumer_error(consumer_errors)
+                if stop_requested.is_set():
+                    break
                 action_index_before, raw_left_over, queue_size_before = (
                     action_queue.snapshot_left_over())
                 prefix_len = self._resolve_prefix_len(raw_left_over)
-                rtc_payload = self._build_rtc_payload(raw_left_over,
-                                                      prefix_len)
+                rtc_payload = (None
+                               if prefix_len == 0 else self._build_rtc_payload(
+                                   raw_left_over, prefix_len))
+                if rtc_payload is None:
+                    overwatch.warning(
+                        '[RemoteRTC %d] no raw prefix remains; requesting '
+                        'an unguided recovery chunk while holding the last '
+                        'accepted target.', chunk_index + 1)
 
                 new_raw, new_processed, inference_elapsed = (
                     self._request_action_pair(inputs, rtc=rtc_payload))
                 self._raise_consumer_error(consumer_errors)
+                with self._chunk_accept_lock:
+                    discard_result = stop_requested.is_set()
+                    if not discard_result:
+                        measured_delay = min(
+                            math.ceil(inference_elapsed / self.dt),
+                            self.action_chunk,
+                        )
+                        observed_delay = max(
+                            0,
+                            action_queue.get_action_index() -
+                            action_index_before,
+                        )
+                        hold_delay = self._resolve_hold_delay(
+                            measured_delay,
+                            observed_delay,
+                            action_queue.qsize() == 0,
+                        )
+                        used_delay = action_queue.merge(
+                            new_raw[:self.action_chunk],
+                            new_processed[:self.action_chunk],
+                            real_delay=measured_delay,
+                            action_index_before_inference=action_index_before,
+                            extra_delay=hold_delay,
+                        )
+                        self._last_e2e_latency_s = inference_elapsed
+                        self._prev_ctx = self._action_ctx
+                if discard_result:
+                    overwatch.info(
+                        'Discarding RemoteRTC chunk %d because s was pressed '
+                        'while inference was in flight.', chunk_index + 1)
+                    break
 
-                measured_delay = min(
-                    math.ceil(inference_elapsed / self.dt),
-                    self.action_chunk,
-                )
-                final_chunk = chunk_index == len(instructions)
-                plan_length = (
-                    self.execute_horizon if final_chunk else self.action_chunk)
-                used_delay = action_queue.merge(
-                    new_raw[:plan_length],
-                    new_processed[:plan_length],
-                    real_delay=measured_delay,
-                    action_index_before_inference=action_index_before,
-                )
-                self._last_e2e_latency_s = inference_elapsed
-                self._prev_ctx = self._action_ctx
-
-                if used_delay > prefix_len:
+                if prefix_len > 0 and used_delay > prefix_len:
                     overwatch.warning(
-                        '[RemoteRTC %d/%d] actual delay %d exceeded guided '
+                        '[RemoteRTC %d] actual delay %d exceeded guided '
                         'prefix %d; increase latency margin or reserve.',
-                        chunk_index,
-                        len(instructions),
+                        chunk_index + 1,
                         used_delay,
                         prefix_len,
                     )
                 overwatch.info(
-                    '[RemoteRTC %d/%d] e2e=%.1fms measured=%d used=%d '
-                    'prefix=%d raw_left=%d queue=%d->%d',
-                    chunk_index,
-                    len(instructions),
+                    '[RemoteRTC %d] e2e=%.1fms measured=%d used=%d '
+                    'held=%d prefix=%d raw_left=%d queue=%d->%d',
+                    chunk_index + 1,
                     inference_elapsed * 1000.0,
                     measured_delay,
                     used_delay,
+                    hold_delay,
                     prefix_len,
-                    len(raw_left_over),
+                    0 if raw_left_over is None else len(raw_left_over),
                     queue_size_before,
                     action_queue.qsize(),
                 )
+                chunk_index += 1
 
             producer_done.set()
             while consumer_thread.is_alive():
@@ -303,3 +544,57 @@ class Tron2RemoteRTCInferenceRunner(Tron2OverlapInferenceRunner):
                     overwatch.error(
                         'Remote RTC action consumer did not stop within '
                         '2 seconds.')
+
+    def _run_selected_task(self, key_reader, task_id: str):
+        """Run one selected task while a client-side key monitor owns stdin."""
+        overwatch = initialize_overwatch(__name__)
+        instruction = self._get_task_description(task_id)
+        stop_requested = threading.Event()
+        self._chunk_accept_lock = threading.Lock()
+        monitor_done = threading.Event()
+        monitor_errors: list[BaseException] = []
+        monitor_thread = threading.Thread(
+            target=self._monitor_active_keys,
+            args=(key_reader, stop_requested, monitor_done, monitor_errors),
+            daemon=True,
+            name='Tron2-client-active-key-monitor',
+        )
+        monitor_thread.start()
+        try:
+            if task_id in self.task_pose_sequences:
+                self.execute_task_pose(task_id)
+            if not stop_requested.is_set():
+                self._run_continuous_episode(instruction, stop_requested)
+        finally:
+            monitor_done.set()
+            monitor_thread.join(timeout=1.0)
+            if monitor_thread.is_alive():
+                raise RuntimeError('TRON2 active key monitor did not stop.')
+        if monitor_errors:
+            raise RuntimeError('TRON2 active key monitor failed.') from \
+                monitor_errors[0]
+        overwatch.info(
+            'Task %s stopped. The accepted action queue is empty; '
+            'select a task ID before pressing b again.', task_id)
+
+    def run(self, initial_instruction: str = ''):
+        """Run the robot-client-only keyboard state machine until Ctrl+C."""
+        del initial_instruction
+        overwatch = initialize_overwatch(__name__)
+        overwatch.info('Starting TRON2 client keyboard control. All b/s/r '
+                       'handling runs on this robot computer.')
+
+        with _TerminalKeyReader() as key_reader:
+            while True:
+                command, task_id = self._wait_for_idle_command(key_reader)
+                if command == 'prepare':
+                    try:
+                        self._move_to_prepare_pose()
+                        overwatch.info('Prepare-pose sequence completed. '
+                                       'Select a task ID, then press b.')
+                    except Exception as exc:
+                        overwatch.error(
+                            'Prepare-pose command failed; client '
+                            'remains idle: %s', exc)
+                    continue
+                self._run_selected_task(key_reader, task_id)

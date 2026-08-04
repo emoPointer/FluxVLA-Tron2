@@ -248,7 +248,7 @@ inference = dict(
     enable_head_control=False,
     async_execution=False,
     execute_horizon=10,
-    max_queue_empty_steps=3,
+    hold_warning_interval_s=1.0,
     rtc_config=dict(
         enabled=True,
         method='guidance',
@@ -323,7 +323,7 @@ inference = dict(
         movej_duration=2.0,
         servoj_publish_rate=300.0,
         max_servoj_step_rad=0.2,
-        max_state_source_mismatch_rad=0.5,
+        max_state_source_mismatch_rad=None,
         lock_head=True,
         max_head_hold_error_rad=0.05,
     ))

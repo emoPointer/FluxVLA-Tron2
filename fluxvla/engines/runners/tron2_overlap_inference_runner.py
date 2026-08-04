@@ -53,7 +53,7 @@ class Tron2OverlapInferenceRunner(Tron2InferenceRunner):
                  blend_start_weight: float = 0.0,
                  blend_end_weight: float = 1.0,
                  queue_poll_interval_s: float = 0.005,
-                 max_queue_empty_steps: int = 3,
+                 hold_warning_interval_s: float = 1.0,
                  async_execution: bool = False,
                  *args,
                  **kwargs):
@@ -78,13 +78,13 @@ class Tron2OverlapInferenceRunner(Tron2InferenceRunner):
                 f'got {blend_start_weight} and {blend_end_weight}.')
         if queue_poll_interval_s <= 0:
             raise ValueError('queue_poll_interval_s must be positive.')
-        if max_queue_empty_steps < 0:
-            raise ValueError('max_queue_empty_steps must be non-negative.')
+        if hold_warning_interval_s <= 0:
+            raise ValueError('hold_warning_interval_s must be positive.')
 
         self.blend_start_weight = float(blend_start_weight)
         self.blend_end_weight = float(blend_end_weight)
         self.queue_poll_interval_s = float(queue_poll_interval_s)
-        self.max_queue_empty_steps = int(max_queue_empty_steps)
+        self.hold_warning_interval_s = float(hold_warning_interval_s)
 
     def _arm_action_indices(self, action_dim: int) -> np.ndarray:
         if self.action_layout == 'tron2_16':
@@ -194,23 +194,48 @@ class Tron2OverlapInferenceRunner(Tron2InferenceRunner):
                          producer_done: threading.Event,
                          shutdown_event: threading.Event,
                          errors: list[BaseException]) -> None:
-        empty_steps = 0
+        overwatch = initialize_overwatch(__name__)
         next_deadline = time.perf_counter()
+        last_warning_at = float('-inf')
+        last_warning_key = None
+        suppressed_warnings = 0
         try:
             while not shutdown_event.is_set():
                 action = action_queue.get()
                 if action is None:
                     if producer_done.is_set():
                         return
-                    empty_steps += 1
-                    if empty_steps > self.max_queue_empty_steps:
-                        raise RuntimeError(
-                            'Overlap action queue underrun: no action was '
-                            f'available for {empty_steps} consecutive 30 Hz '
-                            'control ticks.')
+                    hold_reason = (
+                        'action queue is empty; keeping the previous ServoJ '
+                        'target unchanged')
+                    hold_key = 'queue-empty'
                 else:
-                    empty_steps = 0
-                    self._execute_waypoint(action)
+                    try:
+                        self._execute_waypoint(action)
+                        hold_reason = None
+                        hold_key = None
+                    except ValueError as exc:
+                        hold_reason = (
+                            f'action waypoint rejected ({exc}); keeping the '
+                            'previous ServoJ target unchanged')
+                        hold_key = 'waypoint-rejected'
+
+                if hold_reason is None:
+                    last_warning_key = None
+                    suppressed_warnings = 0
+                else:
+                    now = time.perf_counter()
+                    if (hold_key != last_warning_key or now - last_warning_at
+                            >= self.hold_warning_interval_s):
+                        suppressed = ('' if suppressed_warnings == 0 else
+                                      f'; suppressed={suppressed_warnings}')
+                        overwatch.warning('[Hold] %s%s', hold_reason,
+                                          suppressed)
+                        last_warning_at = now
+                        last_warning_key = hold_key
+                        suppressed_warnings = 0
+                    else:
+                        suppressed_warnings += 1
 
                 next_deadline += self.dt
                 remaining = next_deadline - time.perf_counter()

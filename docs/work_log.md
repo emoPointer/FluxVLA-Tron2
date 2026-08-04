@@ -824,3 +824,130 @@ commands and results that were actually executed.
   - the GPU service must be restarted with this RTC code before a
     dry run. Real latency, reserve, and boundary diagnostics remain untested on
     the deployed checkpoint/robot pair.
+
+## 2026-08-04 17:57 CST — Hold the last ServoJ target on recoverable client faults
+
+- Baseline preservation: committed the completed remote-RTC implementation
+  locally as `cade4c4 Add server-side RTC for Tron2 remote inference` before
+  this behavior change. The untracked user file `command.md` was excluded and
+  no push was performed.
+- Objective: avoid ending a robot episode for a transient action-queue underrun
+  or a rejected policy waypoint. Keep only the requested deployment checks:
+  0.2-rad adjacent ServoJ target delta, locked head with a 0.05-rad measured
+  drift limit, and action/state shape, finite-value, and gripper-range checks.
+- Behavior changes:
+  - disabled Bridge/control duplicate-state mismatch blocking in all active
+    TRON2 configs and in the operator default;
+  - when the queue is temporarily empty, submit no new target so the persistent
+    MotionController holds its last accepted ServoJ target, and emit a
+    rate-limited warning once per second instead of aborting the episode;
+  - treat policy/action validation `ValueError`s the same way: skip the rejected
+    waypoint, preserve the live controller and last target, warn, and continue
+    with later waypoints. The operator no longer disconnects the controller for
+    these recoverable rejections;
+  - keep connection, protocol, controller-thread, and other infrastructure
+    failures fatal because the client cannot guarantee that the robot is still
+    receiving or holding a target after such a failure;
+  - account for wall-clock held frames when aligning the next GPU RTC result.
+    If the old raw-action reserve is completely exhausted, request one
+    unguided recovery chunk and resume guidance once a raw remainder exists.
+- Documentation: updated both READMEs, the deployment guide, and the RTC guide
+  with the retained checks, hold/warning behavior, RTC alignment, and recovery
+  boundary.
+- Validation actually executed:
+  - `pytest -q test/test_ci_smoke.py test/test_tron2_env_operator.py` passed all
+    33 tests with five existing third-party warnings;
+  - tests cover persistent queue underrun, rejected-waypoint continuation,
+    active-controller preservation, disabled source mismatch, held-frame RTC
+    alignment, and exhausted-reserve recovery;
+  - focused `py_compile`, `git diff --check`, and YAPF diff checks passed.
+- PCM synchronization:
+  - confirmed no inference/client/MotionController process was running;
+  - backed up the four replaced files under
+    `/home/guest/FluxVLA-Tron2/.sync-backups/20260804-hold-and-warn.ur6mU1`;
+  - synchronized the active PI0.5 config, TRON2 operator, overlap runner, and
+    remote-RTC runner;
+  - PCM compilation, config parsing, exact Torch-free import, and local/PCM
+    SHA-256 equality passed; no robot or inference process was started.
+- Remaining risk: the previously observed full-state MotionController startup
+  frame can physically move the head before the first policy waypoint. The
+  retained head lock will now warn and hold instead of ending the episode, but
+  it does not correct that upstream controller/firmware behavior.
+
+## 2026-08-04 18:36 CST — Replace repeat count with robot-side b/s/r control
+
+- Objective: remove the fixed repeat-count interaction from the active
+  `Tron2RemoteRTCInferenceRunner` and let the operator start, stop, and prepare
+  the robot from the PCM keyboard without adding state to the GPU service.
+- Client state machine:
+  - in idle state, type a numeric checkpoint task ID and press Enter to select
+    it, then press `b` to start continuous remote RTC inference;
+  - `s` atomically stops acceptance of new action chunks. A GPU request already
+    in flight is allowed to return but its result is discarded, while the
+    action queue accepted before `s` continues to its natural end;
+  - after the accepted queue drains, the client reports idle and deliberately
+    forgets the selection, requiring a task ID before the next `b`;
+  - `r` is accepted only while idle and directly reuses the former task-ID-`0`
+    `_move_to_prepare_pose()` MoveJ path. During inference or queue draining it
+    is ignored with a warning directing the user to press `s` and wait;
+  - a background single-key reader uses terminal cbreak mode and restores the
+    original terminal settings during cleanup. A foreground interactive TTY is
+    required; no keyboard state or command is sent to the GPU service.
+- RTC execution: the finite instruction list was replaced with a continuous
+  per-task loop. Each accepted chunk remains 50 frames, with the existing
+  10-frame inference trigger and server-side guidance. A lock serializes `s`
+  with queue merge so a chunk is unambiguously accepted before `s` or discarded
+  after it.
+- Documentation: updated both READMEs, the TRON2 deployment guide, and RTC guide
+  to remove repeat-count commands, describe the keys and state transitions, and
+  clarify that `execute_horizon` is not a total execution-length limit.
+- Validation actually executed:
+  - `pytest -q test/test_ci_smoke.py test/test_tron2_env_operator.py` passed all
+    38 tests with five existing third-party warnings;
+  - tests cover pseudo-terminal single-key input/restoration, task confirmation,
+    idle `r`, active `r` rejection, active `s`, first-result rejection, in-flight
+    chunk rejection, and accepted-queue draining;
+  - focused `py_compile`, `git diff --check`, and YAPF diff checks passed.
+- PCM synchronization:
+  - confirmed no inference/client/MotionController process was running;
+  - backed up the replaced runner under
+    `/home/guest/FluxVLA-Tron2/.sync-backups/20260804-keyboard-control.oNjpKd`;
+  - synchronized only `tron2_remote_rtc_inference_runner.py`;
+  - PCM compilation, exact Torch-free import, pseudo-TTY single-key/restoration
+    check, and local/PCM SHA-256 equality passed. No inference or physical robot
+    command was started.
+- Remaining operational boundary: after `s`, an already accepted 50-frame
+  action queue is intentionally drained and can therefore run for up to about
+  1.67 seconds at 30 Hz. The key is a graceful inference stop, not a physical
+  emergency stop; the unresolved MotionController startup head behavior is
+  unchanged.
+
+## 2026-08-04 20:33 CST — Stage the flower-only checkpoint for inference
+
+- Objective: copy the flower-only PI0.5 LoRA checkpoint and its required
+  checkpoint-local inference sidecars from the authorized lim training server
+  into the matching local work directory.
+- Artifacts synchronized:
+  - `checkpoints/step-028000-epoch-016-loss=0.0018.safetensors`
+    (`14,466,989,776` bytes, SHA-256
+    `a64e814cfcdf2c5176c8df880d7379f23ca0589feb4d58d5040894086322489f`);
+  - `config.json` (SHA-256
+    `4739a3c867ec90eb4c1535fc6b3b05b7fe9d919e8a9af4e3d90c1d817d205569`);
+  - `dataset_statistics.json` (SHA-256
+    `698a7192cd7bf923c9ec7ad775015afce4ed5710e66a4954c18284f03904a6c8`).
+- Integrity: resumable rsync completed successfully; remote and local sizes and
+  SHA-256 values match. No other checkpoint was copied.
+- Task metadata correction:
+  - the training work directory has no `deployment_metadata.json`, and its
+    saved `config.json` still contains the unrelated banana example prompt;
+  - verified the actual training dataset path as
+    `datasets/lerobot_dataset_task1_flower_all` and read its authoritative
+    `meta/tasks.jsonl`, which defines task 0 as
+    `Put the flowers in the vase`;
+  - preserved the saved training config unchanged and added a minimal local
+    `deployment_metadata.json` mapping deployment task ID `1` to that exact
+    prompt with `action_layout=tron2_16`.
+- Validation actually executed: JSON parsing and
+  `load_deployment_metadata()` resolve the flower prompt, `tron2_16`, and
+  metadata source `deployment_metadata.json`; normalization statistics expose
+  the expected `private` key. The model server and robot were not started.
