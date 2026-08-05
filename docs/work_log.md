@@ -709,3 +709,44 @@ commands and results that were actually executed.
   robot-control WebSocket, MoveJ, ServoJ, gripper command, or physical action
   was started during this migration. The two removed RTC-only files are
   recoverable from the recorded PCM backup.
+
+## 2026-08-05 11:37 CST — Synchronize the six-task LoRA adapter bundle
+
+- Purpose: copy the requested task1/task2 LoRA adapter and its deployment
+  configuration from the authorized training server into the matching local
+  `work_dirs/pi05_task1_task2_lora_rank256_4gpu_bs12_20260805_005442`
+  directory without transferring optimizer state, logs, W&B data, or the
+  14–17 GB merged/training checkpoints.
+- Transfer:
+  - resumed the interrupted `adapter_model.safetensors` download with one
+    serial `rsync --partial --append-verify` process and SSH keepalives;
+  - binding SSH to local address `192.168.110.44` timed out in SYN-SENT during
+    two attempts, while a read-only port probe showed `wlo1` was reachable, so
+    the transfer used `ssh -B wlo1`; zlib level-1 stream compression reduced
+    the remaining network transfer without changing the resulting file;
+  - synchronized the remote root-level `README.md`, `adapter_config.json`,
+    `config.json`, `config.yaml`, `dataset_statistics.json`, and
+    `llm_backbone_config.json`. The remote work directory has no tokenizer or
+    VLM-backbone configuration directory to copy.
+- Deployment metadata:
+  - verified the source dataset task metadata directly under
+    `lerobot_dataset_task1/meta/tasks.jsonl` and
+    `lerobot_dataset_task2/meta/tasks.jsonl`;
+  - added checkpoint-local `deployment_metadata.json` with action layout
+    `tron2_16` and task IDs 1–6. Task 6 is `Put a doll into the gray basket,
+    and put the other doll into the pink basket.`
+- Validation actually executed:
+  - local and remote byte sizes and SHA-256 digests match for the adapter and
+    all six synchronized support files; the adapter is 1,133,695,816 bytes
+    with SHA-256
+    `d8835b237bff4383296e198ce3669ba2bda09975f24561c3d7aec95176d3cd7f`;
+  - JSON and YAML parsing passed; direct safetensors-header validation found
+    838 BF16 tensors and an exact final data extent;
+  - the adapter contains PEFT `base_model.*`/LoRA keys, so it is not a merged
+    model checkpoint that the current serving path can load directly with
+    `strict=True`.
+- Safety boundary: no training, inference service, PCM client, WebSocket
+  connection, or robot-control process was started. The synchronized adapter,
+  checkpoint-local configuration, and deployment metadata remain ignored
+  under `work_dirs/` and were not added to Git; only this work-log record is
+  intended for version control.
