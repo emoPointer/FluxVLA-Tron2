@@ -14,6 +14,7 @@
 """Hardware-free tests for the tron2_env-backed control-mode adapter."""
 
 import threading
+import time
 
 import numpy as np
 import pytest
@@ -400,6 +401,24 @@ def test_active_servoj_ignores_expected_stale_bridge_feedback():
     assert operator._motion_controller is controller
     assert transport.disconnected is False
     assert len(controller.commands) == 2
+
+
+def test_wait_for_trajectory_does_not_cancel_accepted_feeder():
+    operator = make_operator([])
+    feeder_finished = threading.Event()
+
+    def feed():
+        time.sleep(0.02)
+        feeder_finished.set()
+
+    operator._traj_thread = threading.Thread(target=feed)
+    operator._traj_thread.start()
+
+    operator.wait_for_trajectory()
+
+    assert feeder_finished.is_set()
+    assert operator._traj_thread is None
+    assert not operator._traj_stop_event.is_set()
 
 
 def test_servoj_rejects_out_of_range_gripper():

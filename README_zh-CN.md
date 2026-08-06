@@ -555,6 +555,33 @@ chunk。该路径没有 overlap 队列、guidance prefix 或 inference-time RTC�
 如果在推理结果尚未被接收时按 `s`，结果会被丢弃；已经接收的 chunk 会执行完，
 之后不再向控制器发送新动作。再次运行必须重新选择任务 ID，再按 `b`。
 
+### 单进程 prefix RTC
+
+train-time RTC 和 inference-time RTC 是同一部署方法的两个阶段，但不是同一段
+操作：训练阶段让模型学会在已知干净 action 前缀后续写；推理阶段由 runner 把
+上一 chunk 尚未执行完的动作作为该前缀传入模型。RTC 权重不提供前缀也能按普通
+chunk 策略运行，但不会使用训练得到的 RTC 条件能力。
+
+如果模型和 RTC 状态放在同一进程，在 GPU 电脑上直接运行下面的命令，不启动
+ZMQ server、SSH tunnel 或机器人侧 remote client：
+
+```bash
+python scripts/inference.py \
+  --config configs/pi05/pi05_paligemma_tron2_lora_rtc_local_inference.py \
+  --ckpt-path /path/to/merged-rtc-checkpoint.safetensors \
+  --cfg-options inference.dry_run=True
+```
+
+该配置使用 `Tron2RTCInferenceRunner`、`method='prefix'` 和与模型 horizon
+一致的 50 步 chunk，并从 GPU 电脑直接连接观测/控制 WebSocket。`b/s/r` 按键
+状态机也运行在这个终端。按 `s` 后，runner 会等待已经接收的异步轨迹执行完才
+报告 idle，因此只能在 idle 使用的 `r` 不会让 ServoJ 和 prepare-pose MoveJ
+发生竞争。
+
+当前训练配置采样的 prefix 范围是 `[0, 10)`；30 Hz 下覆盖时间不足
+0.333 秒。真实执行前必须先用新 RTC 权重测量端到端推理耗时；如果动态需要的
+prefix 超出训练范围，runner 会打印一次警告。
+
 ## 11. 进入初始位姿
 
 客户端空闲时按 `r`，会执行原 task ID `0` 使用的同一套 prepare pose：

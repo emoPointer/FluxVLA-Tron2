@@ -750,3 +750,128 @@ commands and results that were actually executed.
   checkpoint-local configuration, and deployment metadata remain ignored
   under `work_dirs/` and were not added to Git; only this work-log record is
   intended for version control.
+
+## 2026-08-06 11:05 CST — Add single-process train-time/inference-time prefix RTC deployment
+
+- Purpose: deploy a checkpoint trained with clean-prefix RTC conditioning on
+  the GPU workstation without splitting RTC state across the robot client and
+  a ZeroMQ model server, while preserving the interactive `b`/`s`/idle-only
+  `r` safety workflow.
+- Read-only network validation:
+  - inspected the installed `tron2_env` transport before connecting and
+    confirmed that `init_joints=None` and `init_head=None` disable its implicit
+    initialization motion;
+  - subscribed once to `wss://10.192.1.4/bridge/ws` and received three finite
+    `480x640x3` images plus one finite 18-D state;
+  - connected to `ws://10.192.1.2:5000` at a reduced 10 Hz polling rate and
+    received one finite 18-D state using only
+    `request_get_joint_state`/`request_get_limx_2fclaw_state`;
+  - disconnected both endpoints without sending MoveJ, ServoJ, MoveH, gripper,
+    or emergency-stop requests.
+- Implementation:
+  - synchronized the training-time RTC config (`max_delay=10`, exponential
+    delay sampling) and added a separate single-process deployment config using
+    `Tron2RTCInferenceRunner`, `method='prefix'`, no remote-inference client,
+    asynchronous execution, and a 50-frame chunk matching the model horizon;
+  - retained the inherited real-action and 30 Hz policy settings rather than
+    silently changing established deployment conditions;
+  - local model mode now adopts checkpoint-local task/action metadata just as
+    the remote client does;
+  - added an operator wait primitive and kept the active key monitor running
+    until the accepted asynchronous trajectory feeder finishes. The runner
+    does not report idle or accept reset `r` before that drain completes;
+  - added validation that prevents the local RTC runner from being combined
+    with the old remote-inference protocol or a truncated action chunk, and a
+    one-time warning when the dynamic inference prefix is outside the
+    train-time sampled range.
+- Validation actually executed:
+  - mmengine resolved the deployment to local
+    `Tron2RTCInferenceRunner`, `action_chunk=50`, prefix RTC, 30 Hz, and the two
+    expected WebSocket endpoints;
+  - checkpoint-local metadata resolution returned `tron2_16` and task IDs
+    1–6 from `deployment_metadata.json`;
+  - YAPF, Python bytecode compilation, and `git diff --check` passed;
+  - focused hardware-free tests passed: 34 tests with five existing
+    third-party warnings, including RTC config inheritance, keyboard/reset
+    drain ordering, and non-canceling async trajectory wait behavior.
+- Remaining limitations and risks:
+  - an end-to-end local-model dry run was not started because an unrelated user
+    serving process (PID 495264) already occupied about 19.8 GiB of the 24 GiB
+    RTX 3090; that process was left untouched;
+  - the available complete local checkpoint used for metadata validation was
+    trained without RTC. The remote RTC run remained active at the final check;
+    its newest completed merged checkpoint was step 36000 of 40000. A selected
+    RTC checkpoint still needs to be synchronized before model-quality or
+    real-robot RTC validation;
+  - the prior RTX 3090 inference measurement was about 0.738 seconds (roughly
+    22 policy frames at 30 Hz), outside the training configuration's `[0, 10)`
+    prefix distribution. The new RTC checkpoint needs a no-control latency
+    measurement before real execution.
+
+## 2026-08-06 11:18 CST — Stabilize task IDs for the expanded task1/task2 set
+
+- Purpose: keep one forward-compatible task-ID table while preventing a
+  checkpoint from advertising prompts that were absent from its training
+  data.
+- Source inspection:
+  - read the authorized training server's
+    `lerobot_dataset_task1/meta/tasks.jsonl` and
+    `lerobot_dataset_task2/meta/tasks.jsonl`; task1 contains the flower prompt,
+    while task2 contains ten represented prompts in dataset `task_index`
+    order;
+  - confirmed the separate task3 metadata uses the exact prompt
+    `fold clothes` and that the active RTC training command contains only
+    task1 and task2.
+- Changes:
+  - assigned stable global IDs 1–12: flower is ID 1, the ten task2 prompts are
+    IDs 2–11, and the future fold-clothes task is ID 12;
+  - added the global table to the single-process RTC deployment config;
+  - added checkpoint-local metadata that exposes only IDs 1–11 for the active
+    RTC task1/task2 work directory and only ID 12 for the existing standalone
+    fold-clothes checkpoint;
+  - synchronized the RTC metadata to the matching training-server work
+    directory. The local and remote files have matching SHA-256
+    `df57c2766951c34959be523fa48150db60a6a208b7b4298d7c7c392df1055e4f`.
+- Validation actually executed:
+  - parsed both local JSON sidecars and the synchronized remote JSON;
+  - checkpoint metadata resolution returned IDs 1–11 for the RTC work
+    directory and ID 12 for the fold-clothes work directory;
+  - YAPF reported no remaining formatting diff, `git diff --check` passed,
+    Python bytecode compilation passed, and all 18 focused CI-smoke tests
+    passed with five existing third-party warnings.
+- Remaining boundary: the global ID 12 is intentionally reserved for a future
+  combined checkpoint, but the currently training RTC checkpoint does not
+  expose it. A future combined work directory must receive checkpoint-local
+  metadata containing IDs 1–12 after fold-clothes data is actually included.
+
+## 2026-08-06 12:10 CST — Synchronize the final 40k task1/task2 RTC checkpoint
+
+- Purpose: place the requested final merged RTC checkpoint and all files
+  required by single-process inference in the matching local work-directory
+  structure.
+- Transfer:
+  - used resumable `rsync --partial --append-verify` over the authorized SSH
+    connection to copy
+    `step-040000-epoch-004-loss=0.0035.safetensors` into the local
+    `checkpoints/` directory;
+  - synchronized `config.json`, `config.yaml`, `dataset_statistics.json`,
+    `deployment_metadata.json`, `llm_backbone_config.json`, README and the
+    small adapter manifest files;
+  - copied the six tokenizer assets from the training repository's
+    `checkpoints/pi05_base` into this work directory's `tokenizer/` directory,
+    matching the inference dataset's checkpoint-local tokenizer resolution;
+  - intentionally excluded `.pt` checkpoints, older steps, the LoRA adapter
+    weights, training logs and metric files because the selected merged
+    checkpoint does not use them during inference.
+- Validation actually executed:
+  - local size is 14,466,989,776 bytes and local/remote SHA-256 both equal
+    `a4c8115e33cad1439f49414b906c94bb5ccc58b69f7fa18633e8b8e276af8093`;
+  - all synchronized root metadata and tokenizer files match their remote
+    SHA-256 values;
+  - JSON and YAML parsing passed; safetensors-header validation found 812
+    tensors and an exact final data boundary;
+  - the checkpoint-local Gemma tokenizer loaded with offline mode enabled, the
+    configured inference dataset built successfully, and deployment metadata
+    resolved `tron2_16` with task IDs 1–11.
+- Safety boundary: no model was loaded onto the GPU, no inference or robot
+  client was started, and no observation or control WebSocket was contacted.

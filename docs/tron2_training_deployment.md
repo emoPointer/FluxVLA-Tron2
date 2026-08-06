@@ -512,6 +512,35 @@ has not yet been accepted; an already accepted chunk is allowed to finish, and
 no subsequent prediction is sent to the controller. A new run requires a new
 task-ID selection followed by `b`.
 
+### Single-process prefix RTC
+
+Train-time RTC and inference-time RTC are two stages of one deployment method.
+The training config teaches the model to continue after a known clean action
+prefix; the runtime runner supplies the unconsumed previous chunk as that
+prefix. An RTC-trained checkpoint can run without runtime conditioning, but it
+then behaves as an ordinary chunk policy and does not use the trained RTC path.
+
+To keep the model and RTC state in one process, run the following on the GPU
+computer. Do not start the ZMQ server, SSH tunnel, or remote client:
+
+```bash
+python scripts/inference.py \
+  --config configs/pi05/pi05_paligemma_tron2_lora_rtc_local_inference.py \
+  --ckpt-path /path/to/merged-rtc-checkpoint.safetensors \
+  --cfg-options inference.dry_run=True
+```
+
+This config uses `Tron2RTCInferenceRunner`, `method='prefix'`, a 50-frame chunk
+matching the model horizon, and direct Bridge/control WebSocket connections.
+The `b`/`s`/`r` keyboard state machine runs in this GPU-computer terminal.
+After `s`, the accepted asynchronous trajectory drains before the runner
+reports idle, so idle-only `r` cannot race ServoJ with the MoveJ prepare pose.
+
+The current training recipe samples prefixes in `[0, 10)`. At 30 Hz this spans
+less than 0.333 seconds. Measure the new checkpoint's end-to-end inference
+latency in dry run before real execution; the runner warns if the dynamically
+required prefix is outside the train-time range.
+
 ## 11. Move to the Prepare Pose
 
 While the client is idle, press `r` to run the same configured prepare-pose

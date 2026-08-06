@@ -207,20 +207,23 @@ class Tron2InferenceRunner(BaseInferenceRunner):
     def run_setup(self):
         """Verify inference connectivity and adopt checkpoint task metadata."""
         super().run_setup()
-        if not self._use_remote:
-            return
+        if self._use_remote:
+            import msgpack
 
-        import msgpack
-
-        request = msgpack.packb({'endpoint': 'get_deployment_metadata'})
-        with self._zmq_lock:
-            self._zmq_socket.send(request)
-            response = msgpack.unpackb(self._zmq_socket.recv(), raw=False)
-        if response.get('error'):
-            raise RuntimeError(
-                'Inference server does not provide checkpoint deployment '
-                'metadata. Restart it with the synchronized server code: '
-                f"{response['error']}")
+            request = msgpack.packb({'endpoint': 'get_deployment_metadata'})
+            with self._zmq_lock:
+                self._zmq_socket.send(request)
+                response = msgpack.unpackb(self._zmq_socket.recv(), raw=False)
+            if response.get('error'):
+                raise RuntimeError(
+                    'Inference server does not provide checkpoint deployment '
+                    'metadata. Restart it with the synchronized server code: '
+                    f"{response['error']}")
+        else:
+            if self.ckpt_path is None:
+                return
+            from .serving.serve import load_deployment_metadata
+            response = load_deployment_metadata(self.cfg, self.ckpt_path)
 
         server_layout = response.get('action_layout')
         if server_layout != self.action_layout:
@@ -380,7 +383,7 @@ class Tron2InferenceRunner(BaseInferenceRunner):
 
     def _run_continuous_task(self, instruction: str,
                              stop_requested: threading.Event):
-        """Run sequential non-RTC chunks until ``s`` requests a stop."""
+        """Run action chunks until ``s`` requests a stop."""
         from ..utils import initialize_overwatch
 
         overwatch = initialize_overwatch(__name__)
@@ -429,8 +432,30 @@ class Tron2InferenceRunner(BaseInferenceRunner):
 
             self._prev_ctx = self._action_ctx
             chunk_index += 1
-            overwatch.info('Completed non-RTC action chunk %d (%d frames).',
+            overwatch.info('Completed action chunk %d (%d frames).',
                            chunk_index, len(actions))
+
+    def _wait_for_accepted_trajectory(self):
+        """Keep reset disabled until the active async ServoJ feeder drains."""
+        if not self.async_execution:
+            return
+        wait_for_trajectory = getattr(self.ros_operator, 'wait_for_trajectory',
+                                      None)
+        if wait_for_trajectory is None:
+            raise RuntimeError('Asynchronous TRON2 execution requires the '
+                               'operator to expose wait_for_trajectory().')
+
+        from ..utils import initialize_overwatch
+
+        overwatch = initialize_overwatch(__name__)
+        overwatch.info('Waiting for the accepted action trajectory to finish '
+                       'before idle/reset is enabled.')
+        try:
+            wait_for_trajectory()
+        except ValueError as exc:
+            overwatch.warning(
+                '[Hold] asynchronous action trajectory was rejected (%s); '
+                'the previous ServoJ target remains unchanged.', exc)
 
     def _run_selected_task(self, key_reader, task_id: str):
         """Run a selected task while the PCM key monitor owns stdin."""
@@ -455,10 +480,14 @@ class Tron2InferenceRunner(BaseInferenceRunner):
             if not stop_requested.is_set():
                 self._run_continuous_task(instruction, stop_requested)
         finally:
-            monitor_done.set()
-            monitor_thread.join(timeout=1.0)
-            if monitor_thread.is_alive():
-                raise RuntimeError('TRON2 active key monitor did not stop.')
+            try:
+                self._wait_for_accepted_trajectory()
+            finally:
+                monitor_done.set()
+                monitor_thread.join(timeout=1.0)
+                if monitor_thread.is_alive():
+                    raise RuntimeError(
+                        'TRON2 active key monitor did not stop.')
         if monitor_errors:
             raise RuntimeError('TRON2 active key monitor failed.') from \
                 monitor_errors[0]
@@ -469,13 +498,15 @@ class Tron2InferenceRunner(BaseInferenceRunner):
     def run(self,
             initial_instruction:
             str = 'place it in the brown paper bag with right arm'):
-        """Run the PCM-local non-RTC keyboard state machine until Ctrl+C."""
+        """Run the client-local keyboard state machine until Ctrl+C."""
         from ..utils import initialize_overwatch
 
         del initial_instruction
         overwatch = initialize_overwatch(__name__)
-        overwatch.info('Starting non-RTC TRON2 client keyboard control. All '
-                       'b/s/r handling runs on this robot computer.')
+        overwatch.info(
+            'Starting TRON2 keyboard control with %s. All b/s/r '
+            'handling runs in this client terminal.',
+            type(self).__name__)
         if self._use_remote:
             inference_context = contextlib.nullcontext()
         else:

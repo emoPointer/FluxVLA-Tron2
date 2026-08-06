@@ -105,6 +105,7 @@ class BaseInferenceRunner:
                  enable_mixed_precision: bool = True,
                  remote_inference: Dict = None,
                  **kwargs):
+        self.cfg = cfg
         self.ckpt_path = ckpt_path
         self._use_remote = remote_inference is not None
         if _REMOTE_CLIENT_ONLY and not self._use_remote:

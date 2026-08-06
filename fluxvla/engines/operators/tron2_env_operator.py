@@ -799,6 +799,24 @@ class Tron2EnvOperator:
                 raise RuntimeError('ServoJ trajectory feeder did not stop.')
         self._traj_thread = None
 
+    def wait_for_trajectory(self):
+        """Wait until the accepted policy trajectory has finished feeding.
+
+        Unlike :meth:`stop_trajectory`, this does not set the stop event. It is
+        used by the keyboard state machine so idle-only MoveJ reset cannot race
+        an accepted asynchronous ServoJ trajectory.
+        """
+        thread = self._traj_thread
+        if (thread is not None and thread.is_alive()
+                and thread is not threading.current_thread()):
+            thread.join()
+        self._traj_thread = None
+
+        error = self._trajectory_error
+        self._trajectory_error = None
+        if error is not None:
+            raise error
+
     def close(self):
         """Stop observation/control threads and disconnect both WebSockets."""
         if self._closed:

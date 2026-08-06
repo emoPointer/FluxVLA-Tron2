@@ -30,6 +30,8 @@ from mmengine import Config
 from fluxvla.engines.runners.serving.serve import load_deployment_metadata
 from fluxvla.engines.runners.tron2_inference_runner import (
     Tron2InferenceRunner, _TerminalKeyReader)
+from fluxvla.engines.runners.tron2_rtc_inference_runner import \
+    Tron2RTCInferenceRunner
 
 ROOT = Path(__file__).resolve().parents[1]
 
@@ -74,6 +76,54 @@ def test_tron2_lora_config_deployment_defaults():
     assert operator['max_state_source_mismatch_rad'] is None
     assert operator['lock_head'] is True
     assert operator['max_head_hold_error_rad'] == 0.05
+
+
+def test_tron2_rtc_local_inference_config():
+    cfg = Config.fromfile(ROOT / 'configs' / 'pi05' /
+                          'pi05_paligemma_tron2_lora_rtc_local_inference.py')
+    inference = cfg.inference
+
+    assert inference.type == 'Tron2RTCInferenceRunner'
+    assert inference.remote_inference is None
+    assert inference.action_chunk == 50
+    assert inference.async_execution is True
+    assert inference.execute_horizon is None
+    assert inference.rtc_config == {
+        'enabled': True,
+        'method': 'prefix',
+        'prefix_len': None,
+    }
+    assert inference.publish_rate == 30
+    assert inference.dry_run is False
+    assert cfg.model.rtc_training_config.max_delay == 10
+    assert cfg.inference_model.rtc_training_config.max_delay == 10
+    assert inference.task_descriptions == {
+        '1':
+        'Put the flowers in the vase',
+        '2':
+        'Put both dolls into the pink basket',
+        '3':
+        'Put both dolls into the gray basket',
+        '4':
+        'Put both pens into the pink basket',
+        '5':
+        'Put both pens into the gray basket',
+        '6': ('Put a doll into the gray basket, and put the other doll into '
+              'the pink basket.'),
+        '7': ('Put a pen into the gray basket, and put the other  pen into '
+              'the pink basket.'),
+        '8': ('Put both dolls into the pink basket, and put both pens into '
+              'the gray basket.'),
+        '9': ('Put both dolls into the gray basket, and put both pens into '
+              'the pink basket.'),
+        '10':
+        'Put all the objects into the pink basket.',
+        '11':
+        'Put all the objects into the gray basket.',
+        '12':
+        'fold clothes',
+    }
+    assert issubclass(Tron2RTCInferenceRunner, Tron2InferenceRunner)
 
 
 def test_all_tron2_configs_use_tron2_env_operator():
@@ -302,6 +352,31 @@ def test_tron2_active_keyboard_stops_and_ignores_prepare():
 
     assert not monitor_thread.is_alive()
     assert not monitor_errors
+
+
+def test_tron2_async_task_drains_before_idle_reset_is_enabled():
+    runner = Tron2InferenceRunner.__new__(Tron2InferenceRunner)
+    runner.async_execution = True
+    runner.task_descriptions = {'1': 'put flowers in vase'}
+    runner.task_pose_sequences = {}
+    events = []
+
+    class FakeOperator:
+
+        def wait_for_trajectory(self):
+            events.append('trajectory_finished')
+
+    runner.ros_operator = FakeOperator()
+
+    def run_continuous_task(instruction, stop_requested):
+        assert instruction == 'put flowers in vase'
+        events.append('task_stopped')
+        stop_requested.set()
+
+    runner._run_continuous_task = run_continuous_task
+    runner._run_selected_task(_FakeKeyReader([]), '1')
+
+    assert events == ['task_stopped', 'trajectory_finished']
 
 
 def _make_non_rtc_runner():
