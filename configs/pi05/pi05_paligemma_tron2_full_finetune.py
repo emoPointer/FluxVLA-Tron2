@@ -265,6 +265,7 @@ inference = dict(
         robot_ip='10.192.1.2',
         ws_port=5000,
         servoj_publish_rate=300.0,
+        recovery_blend_frames=6,
         max_servoj_step_rad=0.2,
         max_state_source_mismatch_rad=None,
         lock_head=True,

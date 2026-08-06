@@ -20,6 +20,8 @@ import numpy as np
 import pytest
 
 from fluxvla.engines.operators.tron2_env_operator import Tron2EnvOperator
+from fluxvla.engines.operators.tron2_native_env_operator import (
+    Tron2NativeEnvOperator, )
 from fluxvla.engines.runners.tron2_inference_runner import (
     Tron2InferenceRunner, )
 
@@ -45,8 +47,8 @@ class FakeTransport:
         del timeout
         return {'states': self.state.copy().tolist()}
 
-    def set_gripper(self, left, right):
-        self.gripper_calls.append((left, right))
+    def set_gripper(self, left_opening, right_opening):
+        self.gripper_calls.append((left_opening, right_opening))
 
     def movej(self, target, move_time):
         self.movej_calls.append((np.asarray(target).copy(), move_time))
@@ -78,19 +80,60 @@ class FakeMotionController:
     def get_joint_states(self, timeout=1.0):
         return self.transport.get_joint_state(timeout)
 
+    def get_head_position(self):
+        return self.transport.state[16:18].copy()
+
     def is_connected(self):
         return self.transport.is_connected()
 
-    def set_gripper(self, left, right):
-        self.gripper_calls.append((left, right))
+    def set_gripper(self, left_opening, right_opening):
+        self.gripper_calls.append((left_opening, right_opening))
 
     def command_joints(self, target, eta=None):
         self.commands.append((np.asarray(target).copy(), eta))
 
 
+class FakeNativeConfig:
+
+    def __init__(self, **kwargs):
+        self.__dict__.update(kwargs)
+
+
+class FakeNativeEnv:
+
+    instances = []
+
+    def __init__(self, config):
+        self.config = config
+        self.closed = False
+        self.steps = []
+        self.last_action = None
+        type(self).instances.append(self)
+
+    def get_obs(self):
+        return make_bridge_observation()
+
+    def step(self, action):
+        action = np.asarray(action, dtype=np.float64)
+        self.steps.append(action.copy())
+        if len(action) == 16:
+            self.last_action = np.concatenate(
+                [action[:7], action[8:15], [0.4, -0.3]])
+        else:
+            self.last_action = np.concatenate(
+                [action[:7], action[8:15], action[16:18]])
+
+    def close(self):
+        self.closed = True
+
+
 def make_operator(transports):
     operator = Tron2EnvOperator.__new__(Tron2EnvOperator)
     operator.servoj_publish_rate = 300.0
+    operator.recovery_blend_frames = 6
+    operator.chunk_boundary_blend_enabled = False
+    operator.chunk_boundary_blend_frames = 6
+    operator.chunk_boundary_blend_scope = 'arm'
     operator.state_polling_rate = 200.0
     operator.connection_timeout = 1.0
     operator.state_timeout = 1.0
@@ -116,6 +159,15 @@ def make_operator(transports):
     operator._trajectory_error = None
     operator._traj_thread = None
     operator._traj_stop_event = threading.Event()
+    operator._last_servoj_waypoint = None
+    operator._last_left_gripper = None
+    operator._last_right_gripper = None
+    operator._recovery_blend_pending = False
+    operator._active_servoj_waypoints = None
+    operator._active_left_gripper = None
+    operator._active_right_gripper = None
+    operator._active_next_index = 0
+    operator._issued_action_callback = None
     operator._runtime_types = lambda: (FakeMotionController, None, None)
     operator._create_transport = lambda: transports.pop(0)
     return operator
@@ -133,6 +185,75 @@ def make_bridge_observation():
             'observation_source': 'bridge'
         },
     }
+
+
+def make_native_operator(monkeypatch):
+    FakeNativeEnv.instances = []
+    runtime_types = (FakeNativeConfig, FakeNativeConfig, FakeNativeConfig,
+                     FakeNativeConfig, FakeNativeEnv)
+    monkeypatch.setattr(
+        Tron2NativeEnvOperator,
+        '_runtime_types',
+        staticmethod(lambda: runtime_types),
+    )
+    return Tron2NativeEnvOperator(
+        robot_ip='10.192.1.2',
+        bridge_host='wss://10.192.1.4',
+        bridge_state_source='legacy',
+        state_dim=18,
+        fps=30.0,
+        publish_rate=300.0,
+        init_joints=np.zeros(14),
+        init_head=None,
+    )
+
+
+def test_native_operator_delegates_observation_and_step(monkeypatch):
+    operator = make_native_operator(monkeypatch)
+    env = FakeNativeEnv.instances[-1]
+    issued = []
+    operator.set_issued_action_callback(lambda **record: issued.append(record))
+
+    observation = operator.get_observation()
+    operator.execute_waypoint(
+        left_arm=np.arange(7, dtype=np.float64) / 10.0,
+        right_arm=-np.arange(7, dtype=np.float64) / 10.0,
+        left_gripper=-0.2,
+        right_gripper=1.4,
+        trajectory_index=3,
+    )
+
+    assert observation['state'].shape == (18, )
+    assert env.config.observation_source == 'bridge'
+    assert env.config.bridge_state_source == 'legacy'
+    assert env.config.fps == 30.0
+    assert env.config.publish_rate == 300.0
+    assert len(env.steps) == 1
+    np.testing.assert_allclose(
+        env.steps[0],
+        np.concatenate([
+            np.arange(7, dtype=np.float64) / 10.0,
+            [-0.2],
+            -np.arange(7, dtype=np.float64) / 10.0,
+            [1.4],
+        ]),
+    )
+    assert issued[0]['trajectory_index'] == 3
+    assert issued[0]['left_gripper'] == pytest.approx(0.0)
+    assert issued[0]['right_gripper'] == pytest.approx(1.0)
+    np.testing.assert_allclose(issued[0]['waypoint'][-2:], [0.4, -0.3])
+
+
+def test_native_reset_reconstructs_upstream_environment(monkeypatch):
+    operator = make_native_operator(monkeypatch)
+    first = FakeNativeEnv.instances[-1]
+
+    operator.reset_native_env()
+
+    second = FakeNativeEnv.instances[-1]
+    assert first.closed is True
+    assert second is not first
+    assert operator.native_env is second
 
 
 class FakeBridgeProvider:
@@ -186,6 +307,7 @@ def test_operator_uses_bridge_without_ros(monkeypatch):
 def test_runner_maps_bridge_state_to_training_layout(layout, expected):
     runner = Tron2InferenceRunner.__new__(Tron2InferenceRunner)
     runner.action_layout = layout
+    runner.include_head_in_state = False
     runner.camera_names = ['cam_high', 'cam_left_wrist', 'cam_right_wrist']
     runner.observation_window = None
     runner.ros_operator = type(
@@ -197,6 +319,24 @@ def test_runner_maps_bridge_state_to_training_layout(layout, expected):
 
     np.testing.assert_array_equal(observation['qpos'], expected)
     assert observation['cam_high'].shape == (4, 6, 3)
+
+
+def test_runner_keeps_measured_head_in_tron2_16_model_state():
+    runner = Tron2InferenceRunner.__new__(Tron2InferenceRunner)
+    runner.action_layout = 'tron2_16'
+    runner.include_head_in_state = True
+    runner.camera_names = ['cam_high', 'cam_left_wrist', 'cam_right_wrist']
+    runner.observation_window = None
+    runner.ros_operator = type(
+        'FakeObservationOperator', (),
+        {'get_observation': lambda self: make_bridge_observation()})()
+    runner._apply_jpeg_compression = lambda image: image
+
+    observation = runner.update_observation_window()
+
+    np.testing.assert_array_equal(observation['qpos'],
+                                  np.arange(18, dtype=np.float32))
+    np.testing.assert_array_equal(runner._latest_head_position, [16.0, 17.0])
 
 
 def test_prepare_uses_movej_then_policy_uses_servoj():
@@ -240,6 +380,101 @@ def test_prepare_uses_movej_then_policy_uses_servoj():
     assert controller.gripper_calls == [(100.0, 50.0), (90.0, 40.0)]
 
 
+def test_operator_reports_only_policy_waypoints_issued_to_servoj():
+    transport = FakeTransport()
+    operator = make_operator([transport])
+    issued = []
+    operator.set_issued_action_callback(lambda **record: issued.append(record))
+    left = np.array([[0.01] * 7, [0.02] * 7])
+    right = -left
+
+    operator.execute_trajectory(
+        left,
+        right,
+        np.array([0.25, 0.5]),
+        np.array([0.75, 1.0]),
+        dt=0.001,
+        action_metadata={
+            'trajectory_id': 7,
+            'rtc_enabled': True,
+        },
+    )
+
+    assert len(issued) == 2
+    np.testing.assert_allclose(issued[0]['waypoint'][:7], left[0])
+    np.testing.assert_allclose(issued[1]['waypoint'][7:14], right[1])
+    assert issued[0]['left_gripper'] == pytest.approx(0.25)
+    assert issued[1]['right_gripper'] == pytest.approx(1.0)
+    assert issued[0]['trajectory_index'] == 0
+    assert issued[1]['trajectory_index'] == 1
+    assert issued[0]['action_metadata'] == {
+        'trajectory_id': 7,
+        'rtc_enabled': True,
+    }
+    assert issued[0]['issued_at_unix'] > 0
+    assert issued[0]['issued_at_monotonic'] > 0
+
+
+def test_persistent_waypoint_stream_keeps_one_motion_controller():
+    transport = FakeTransport()
+    operator = make_operator([transport])
+    issued = []
+    operator.set_issued_action_callback(lambda **record: issued.append(record))
+
+    operator.begin_waypoint_stream()
+    operator.execute_waypoint(
+        left_arm=np.full(7, 0.01),
+        right_arm=np.full(7, -0.01),
+        left_gripper=0.2,
+        right_gripper=0.8,
+        dt=1.0 / 30.0,
+        trajectory_index=3,
+    )
+    controller = operator._motion_controller
+    operator.execute_waypoint(
+        left_arm=np.full(7, 0.02),
+        right_arm=np.full(7, -0.02),
+        left_gripper=0.3,
+        right_gripper=0.7,
+        dt=1.0 / 30.0,
+        trajectory_index=4,
+    )
+
+    assert operator._motion_controller is controller
+    assert controller.started is True
+    assert len(controller.commands) == 2
+    assert controller.commands[0][1] is None
+    assert controller.commands[1][1] is None
+    assert controller.gripper_calls == pytest.approx([(20.0, 80.0),
+                                                      (30.0, 70.0)])
+    assert [record['trajectory_index'] for record in issued] == [3, 4]
+    assert operator._traj_thread is None
+
+
+def test_native_waypoint_matches_tron2_env_step_head_and_gripper_behavior():
+    transport = FakeTransport()
+    transport.state[16:18] = [0.4, -0.3]
+    operator = make_operator([transport])
+
+    operator.execute_waypoint(
+        left_arm=np.arange(7, dtype=np.float64) / 10.0,
+        right_arm=-np.arange(7, dtype=np.float64) / 10.0,
+        left_gripper=-0.2,
+        right_gripper=1.4,
+        dt=1.0 / 30.0,
+    )
+
+    controller = operator._motion_controller
+    expected = np.concatenate([
+        np.arange(7, dtype=np.float64) / 10.0,
+        -np.arange(7, dtype=np.float64) / 10.0,
+        [0.4, -0.3],
+    ])
+    np.testing.assert_allclose(controller.commands[0][0], expected)
+    assert controller.commands[0][1] is None
+    assert controller.gripper_calls == [(0.0, 100.0)]
+
+
 def test_movej_disconnects_active_servoj_controller():
     first_transport = FakeTransport()
     second_transport = FakeTransport()
@@ -261,6 +496,39 @@ def test_movej_disconnects_active_servoj_controller():
     assert len(second_transport.movej_calls) == 1
     assert operator._motion_controller is None
     assert operator._transport is second_transport
+
+
+def test_movej_clears_drained_trajectory_recovery_origin():
+    first_transport = FakeTransport()
+    second_transport = FakeTransport()
+    operator = make_operator([first_transport, second_transport])
+
+    operator.execute_trajectory(
+        np.zeros((1, 7)),
+        np.zeros((1, 7)),
+        np.zeros(1),
+        np.zeros(1),
+        dt=0.001,
+    )
+    assert operator._recovery_blend_pending is True
+
+    operator.move_to_targets(np.zeros(7), np.zeros(7))
+    assert operator._recovery_blend_pending is False
+    assert operator._last_servoj_waypoint is None
+
+    target = np.full((1, 7), 0.12)
+    operator.execute_trajectory(
+        target,
+        -target,
+        np.ones(1),
+        np.full(1, 0.6),
+        dt=0.001,
+    )
+
+    controller = operator._motion_controller
+    np.testing.assert_allclose(controller.commands[0][0][:7], 0.12)
+    np.testing.assert_allclose(controller.commands[0][0][7:14], -0.12)
+    assert controller.gripper_calls[0] == pytest.approx((100.0, 60.0))
 
 
 def test_servoj_rejects_large_first_or_inter_waypoint_delta():
@@ -401,6 +669,131 @@ def test_active_servoj_ignores_expected_stale_bridge_feedback():
     assert operator._motion_controller is controller
     assert transport.disconnected is False
     assert len(controller.commands) == 2
+
+
+def test_drained_servoj_trajectory_blends_six_recovery_frames():
+    transport = FakeTransport()
+    operator = make_operator([transport])
+
+    operator.execute_trajectory(
+        np.zeros((1, 7)),
+        np.zeros((1, 7)),
+        np.zeros(1),
+        np.zeros(1),
+        dt=0.001,
+    )
+    controller = operator._motion_controller
+    assert operator._recovery_blend_pending is True
+
+    left = np.full((6, 7), 0.12)
+    right = np.full((6, 7), -0.12)
+    operator.execute_trajectory(
+        left,
+        right,
+        np.ones(6),
+        np.full(6, 0.6),
+        dt=0.001,
+    )
+
+    recovered_commands = [command[0] for command in controller.commands[1:]]
+    assert len(recovered_commands) == 6
+    for index, command in enumerate(recovered_commands, start=1):
+        alpha = index / 6.0
+        np.testing.assert_allclose(command[:7], 0.12 * alpha)
+        np.testing.assert_allclose(command[7:14], -0.12 * alpha)
+        np.testing.assert_allclose(command[14:], 0.0)
+    assert controller.gripper_calls[1] == pytest.approx((100.0 / 6.0, 10.0))
+    assert controller.gripper_calls[-1] == pytest.approx((100.0, 60.0))
+
+
+def test_active_servoj_preemption_does_not_trigger_recovery_blend():
+    transport = FakeTransport()
+    operator = make_operator([transport])
+    long_trajectory = np.zeros((20, 7))
+
+    operator.execute_trajectory(
+        long_trajectory,
+        long_trajectory,
+        np.zeros(20),
+        np.zeros(20),
+        dt=0.01,
+        async_exec=True,
+    )
+    deadline = time.monotonic() + 1.0
+    while (operator._motion_controller is None
+           and time.monotonic() < deadline):
+        time.sleep(0.001)
+    controller = operator._motion_controller
+    assert controller is not None
+    while not controller.commands and time.monotonic() < deadline:
+        time.sleep(0.001)
+    assert controller.commands
+
+    replacement = np.full((1, 7), 0.12)
+    operator.execute_trajectory(
+        replacement,
+        -replacement,
+        np.ones(1),
+        np.full(1, 0.6),
+        dt=0.001,
+        async_exec=True,
+    )
+    operator.wait_for_trajectory()
+
+    np.testing.assert_allclose(controller.commands[-1][0][:7], 0.12)
+    np.testing.assert_allclose(controller.commands[-1][0][7:14], -0.12)
+    assert controller.gripper_calls[-1] == pytest.approx((100.0, 60.0))
+
+
+def test_active_chunk_replacement_smoothstep_blends_arm_boundary():
+    transport = FakeTransport()
+    operator = make_operator([transport])
+    operator.chunk_boundary_blend_enabled = True
+    operator.chunk_boundary_blend_frames = 4
+
+    old_steps = np.arange(20, dtype=np.float64)[:, None] * 0.01
+    old_left = np.repeat(old_steps, 7, axis=1)
+    old_right = -old_left
+    operator.execute_trajectory(
+        old_left,
+        old_right,
+        np.linspace(0.0, 0.95, 20),
+        np.linspace(0.0, 0.95, 20),
+        dt=1.0,
+        async_exec=True,
+    )
+    deadline = time.monotonic() + 1.0
+    while operator._motion_controller is None and time.monotonic() < deadline:
+        time.sleep(0.001)
+    controller = operator._motion_controller
+    assert controller is not None
+    while len(controller.commands) < 1 and time.monotonic() < deadline:
+        time.sleep(0.001)
+    assert len(controller.commands) == 1
+
+    new_left = np.full((4, 7), 0.12)
+    new_right = -new_left
+    operator.execute_trajectory(
+        new_left,
+        new_right,
+        np.ones(4),
+        np.full(4, 0.6),
+        dt=0.001,
+    )
+
+    recovered_commands = [command[0] for command in controller.commands[1:]]
+    assert len(recovered_commands) == 4
+    for offset, command in enumerate(recovered_commands):
+        u = (offset + 1) / 5.0
+        alpha = u * u * (3.0 - 2.0 * u)
+        old_value = (offset + 1) * 0.01
+        expected_left = (1.0 - alpha) * old_value + alpha * 0.12
+        np.testing.assert_allclose(command[:7], expected_left)
+        np.testing.assert_allclose(command[7:14], -expected_left)
+        np.testing.assert_allclose(command[14:], 0.0)
+    # The configured arm-only scope must not delay gripper commands.
+    assert controller.gripper_calls[1] == pytest.approx((100.0, 60.0))
+    assert controller.gripper_calls[-1] == pytest.approx((100.0, 60.0))
 
 
 def test_wait_for_trajectory_does_not_cancel_accepted_feeder():

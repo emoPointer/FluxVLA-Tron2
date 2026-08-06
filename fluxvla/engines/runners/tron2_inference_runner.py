@@ -13,6 +13,7 @@
 # limitations under the License.
 
 import contextlib
+import json
 import os
 import queue
 import select
@@ -21,6 +22,8 @@ import termios
 import threading
 import time
 import tty
+from datetime import datetime
+from pathlib import Path
 from types import SimpleNamespace
 from typing import Dict, List
 
@@ -29,6 +32,157 @@ import numpy as np
 from ..utils.root import RUNNERS
 from ..utils.trajectory_utils import resample_remaining
 from .base_inference_runner import BaseInferenceRunner
+
+_ACTION_RECORD_STOP = object()
+
+
+class _ActionJSONLRecorder:
+    """Write issued policy-rate actions without blocking robot control."""
+
+    def __init__(self, output_dir: Path):
+        self.output_dir = Path(output_dir)
+        self._lock = threading.Lock()
+        self._enabled = False
+        self._path = None
+        self._handle = None
+        self._queue = None
+        self._writer_thread = None
+        self._action_count = 0
+        self._writer_error = None
+
+    @property
+    def enabled(self) -> bool:
+        with self._lock:
+            return self._enabled
+
+    def start(self, session_metadata: dict) -> Path:
+        """Start one JSONL session and return its collision-free path."""
+        with self._lock:
+            if self._enabled:
+                return self._path
+            if (self._writer_thread is not None
+                    and self._writer_thread.is_alive()):
+                raise RuntimeError('The previous action-record writer has '
+                                   'not stopped yet.')
+
+            self.output_dir.mkdir(parents=True, exist_ok=True)
+            timestamp = datetime.now().astimezone().strftime(
+                '%Y%m%dT%H%M%S_%f%z')
+            mode = session_metadata.get('inference_mode', 'unknown')
+            prefix = f'tron2_actions_{mode}_{timestamp}_{os.getpid()}'
+            sequence = 0
+            while True:
+                suffix = '' if sequence == 0 else f'_{sequence}'
+                path = self.output_dir / f'{prefix}{suffix}.jsonl'
+                try:
+                    handle = path.open('x', encoding='utf-8')
+                    break
+                except FileExistsError:
+                    sequence += 1
+
+            header = dict(session_metadata)
+            header.update(
+                record_type='session_start',
+                format_version=1,
+                started_at_unix=time.time(),
+                started_at_iso=datetime.now().astimezone().isoformat(),
+            )
+            try:
+                handle.write(json.dumps(header, ensure_ascii=False) + '\n')
+                handle.flush()
+            except BaseException:
+                handle.close()
+                path.unlink(missing_ok=True)
+                raise
+
+            self._path = path
+            self._handle = handle
+            self._queue = queue.Queue()
+            self._action_count = 0
+            self._writer_error = None
+            self._enabled = True
+            self._writer_thread = threading.Thread(
+                target=self._write_records,
+                daemon=True,
+                name='Tron2-action-jsonl-writer',
+            )
+            self._writer_thread.start()
+            return path
+
+    def record(self, record: dict) -> bool:
+        """Queue one action record; return ``False`` when recording is off."""
+        with self._lock:
+            if not self._enabled:
+                return False
+            if self._writer_error is not None:
+                raise RuntimeError('Action-record writer failed.') from \
+                    self._writer_error
+            record = dict(record)
+            record['sequence_index'] = self._action_count
+            self._action_count += 1
+            self._queue.put_nowait(record)
+            return True
+
+    def stop(self):
+        """Flush and stop the current session.
+
+        Returns:
+            ``(path, action_count, writer_error)``. ``path`` is ``None`` when
+            no session was active.
+        """
+        with self._lock:
+            if not self._enabled:
+                return self._path, self._action_count, self._writer_error
+            self._enabled = False
+            path = self._path
+            action_count = self._action_count
+            action_queue = self._queue
+            writer_thread = self._writer_thread
+            action_queue.put_nowait({
+                'record_type':
+                'session_end',
+                'action_count':
+                action_count,
+                'ended_at_unix':
+                time.time(),
+                'ended_at_iso':
+                datetime.now().astimezone().isoformat(),
+            })
+            action_queue.put_nowait(_ACTION_RECORD_STOP)
+
+        writer_thread.join(timeout=10.0)
+        if writer_thread.is_alive():
+            raise RuntimeError('Timed out while flushing the action-record '
+                               f'file {path}.')
+        with self._lock:
+            return path, action_count, self._writer_error
+
+    def _write_records(self) -> None:
+        handle = self._handle
+        action_queue = self._queue
+        last_flush = time.monotonic()
+        error = None
+        try:
+            while True:
+                record = action_queue.get()
+                if record is _ACTION_RECORD_STOP:
+                    break
+                handle.write(json.dumps(record, ensure_ascii=False) + '\n')
+                if time.monotonic() - last_flush >= 1.0:
+                    handle.flush()
+                    last_flush = time.monotonic()
+            handle.flush()
+        except BaseException as exc:
+            error = exc
+        finally:
+            try:
+                handle.close()
+            except BaseException as exc:
+                if error is None:
+                    error = exc
+            with self._lock:
+                self._writer_error = error
+                self._enabled = False
 
 
 class _TerminalKeyReader:
@@ -128,6 +282,10 @@ class Tron2InferenceRunner(BaseInferenceRunner):
             head commands during prepare pose execution and trajectory
             execution. Defaults to False.
 
+        action_record_dir (str, optional): Directory for action JSONL files.
+            Relative paths are resolved from the repository root. Recording
+            is disabled until the operator presses ``l``.
+
     """
 
     def __init__(self,
@@ -137,7 +295,9 @@ class Tron2InferenceRunner(BaseInferenceRunner):
                  async_execution: bool = False,
                  execute_horizon: int = None,
                  action_layout: str = 'tron2_18',
+                 include_head_in_state: bool = False,
                  dry_run: bool = False,
+                 action_record_dir: str = 'work_dirs/action_records',
                  *args,
                  **kwargs):
         self.gripper_threshold = gripper_threshold
@@ -145,7 +305,23 @@ class Tron2InferenceRunner(BaseInferenceRunner):
         self.async_execution = async_execution
         self.execute_horizon = execute_horizon
         self.action_layout = action_layout
+        if not isinstance(include_head_in_state, bool):
+            raise ValueError('include_head_in_state must be bool; got '
+                             f'{include_head_in_state!r}.')
+        self.include_head_in_state = include_head_in_state
         self.dry_run = dry_run
+        if not isinstance(action_record_dir, (str, os.PathLike)):
+            raise ValueError('action_record_dir must be a path-like value; '
+                             f'got {action_record_dir!r}.')
+        action_record_path = Path(action_record_dir).expanduser()
+        if not action_record_path.is_absolute():
+            action_record_path = (
+                Path(__file__).resolve().parents[3] / action_record_path)
+        self.action_record_dir = action_record_path.resolve()
+        self._action_recorder = _ActionJSONLRecorder(self.action_record_dir)
+        self._active_task_id = None
+        self._trajectory_submission_index = 0
+        self._latest_head_position = None
         if self.action_layout not in ('tron2_18', 'tron2_16'):
             raise ValueError(
                 f'Unsupported action_layout: {self.action_layout}. '
@@ -180,6 +356,12 @@ class Tron2InferenceRunner(BaseInferenceRunner):
         # Call parent constructor
         super().__init__(*args, **kwargs)
 
+        set_action_callback = getattr(self.ros_operator,
+                                      'set_issued_action_callback', None)
+        self._action_recording_supported = callable(set_action_callback)
+        if self._action_recording_supported:
+            set_action_callback(self._record_issued_action)
+
         self.dt = 1.0 / self.publish_rate
         self._chunk_accept_lock = threading.Lock()
 
@@ -203,6 +385,153 @@ class Tron2InferenceRunner(BaseInferenceRunner):
             ]
         else:
             self.prepare_pose = prepare_pose
+
+    def _action_columns(self) -> list[str]:
+        if self.action_layout == 'tron2_16':
+            return ([f'left_arm_joint_{index}'
+                     for index in range(7)] + ['left_gripper'] +
+                    [f'right_arm_joint_{index}'
+                     for index in range(7)] + ['right_gripper'])
+        return ([f'left_arm_joint_{index}' for index in range(7)] +
+                [f'right_arm_joint_{index}' for index in range(7)] +
+                ['head_pitch', 'head_yaw', 'left_gripper', 'right_gripper'])
+
+    def _rtc_metadata(self):
+        rtc_config = getattr(self, 'rtc_config', None)
+        if not rtc_config:
+            return False, None
+        rtc_config = dict(rtc_config)
+        return bool(rtc_config.get('enabled', False)), rtc_config
+
+    def _action_record_session_metadata(self) -> dict:
+        rtc_enabled, rtc_config = self._rtc_metadata()
+        operator = self.ros_operator
+        return {
+            'inference_mode':
+            'rtc' if rtc_enabled else 'non_rtc',
+            'runner_type':
+            type(self).__name__,
+            'rtc_enabled':
+            rtc_enabled,
+            'rtc_config':
+            rtc_config,
+            'fixed_prefix_execution':
+            getattr(self, 'fixed_prefix_execution', None),
+            'fixed_prefix_late_tolerance_steps':
+            getattr(self, 'fixed_prefix_late_tolerance_steps', None),
+            'checkpoint_path':
+            None if self.ckpt_path is None else str(self.ckpt_path),
+            'action_layout':
+            self.action_layout,
+            'action_columns':
+            self._action_columns(),
+            'publish_rate_hz':
+            self.publish_rate,
+            'servoj_publish_rate_hz':
+            getattr(operator, 'servoj_publish_rate', None),
+            'recovery_blend_frames':
+            getattr(operator, 'recovery_blend_frames', None),
+            'chunk_boundary_blend_enabled':
+            getattr(operator, 'chunk_boundary_blend_enabled', None),
+            'recorded_signal':
+            'issued_policy_rate_servoj_waypoint',
+            'action_units':
+            'arm/head radians; grippers normalized [0, 1]',
+        }
+
+    def _toggle_action_recording(self) -> None:
+        """Toggle issued-action recording from the keyboard thread."""
+        from ..utils import initialize_overwatch
+
+        overwatch = initialize_overwatch(__name__)
+        if not self._action_recording_supported:
+            overwatch.warning(
+                'Action recording is unavailable because operator %s does '
+                'not expose issued-action callbacks.',
+                type(self.ros_operator).__name__)
+            return
+        try:
+            if self._action_recorder.enabled:
+                path, count, error = self._action_recorder.stop()
+                if error is not None:
+                    overwatch.error(
+                        'Action recording stopped after a writer '
+                        'error (%s): %s', error, path)
+                else:
+                    overwatch.info(
+                        'Action recording OFF: %d actions saved '
+                        'to %s', count, path)
+            else:
+                self.ros_operator.set_issued_action_callback(
+                    self._record_issued_action)
+                path = self._action_recorder.start(
+                    self._action_record_session_metadata())
+                overwatch.info(
+                    'Action recording ON: press l again to stop. '
+                    'Writing actual issued 30 Hz policy actions '
+                    'to %s', path)
+        except (OSError, RuntimeError, TypeError, ValueError) as exc:
+            overwatch.error('Could not toggle action recording: %s', exc)
+
+    def _trajectory_action_metadata(self, action_count: int) -> dict:
+        ctx = self._action_ctx
+        rtc_enabled, _ = self._rtc_metadata()
+        self._trajectory_submission_index += 1
+        return {
+            'trajectory_id':
+            self._trajectory_submission_index,
+            'task_id':
+            self._active_task_id,
+            'instruction':
+            getattr(ctx, 'instruction', None),
+            'rtc_enabled':
+            rtc_enabled,
+            'rtc_prefix_len':
+            getattr(ctx, 'rtc_prefix_len', None),
+            'execution_offset_steps':
+            getattr(ctx, 'execution_offset_steps', None),
+            'rtc_switch_lateness_steps':
+            getattr(ctx, 'rtc_switch_lateness_steps', None),
+            'inference_started_at_unix':
+            getattr(ctx, 'inference_start', None),
+            'inference_elapsed_s':
+            getattr(ctx, 'inference_elapsed', None),
+            'submitted_at_unix':
+            time.time(),
+            'submitted_action_count':
+            int(action_count),
+        }
+
+    def _record_issued_action(self, *, waypoint, left_gripper, right_gripper,
+                              trajectory_index, issued_at_unix,
+                              issued_at_monotonic, action_metadata):
+        """Queue one policy waypoint after it is issued to ServoJ."""
+        if not self._action_recorder.enabled:
+            return
+        waypoint = np.asarray(waypoint, dtype=np.float64)
+        if waypoint.shape != (16, ):
+            raise ValueError('Issued ServoJ waypoint must have shape (16,), '
+                             f'got {waypoint.shape}.')
+        if self.action_layout == 'tron2_16':
+            action = np.concatenate([
+                waypoint[:7],
+                [left_gripper],
+                waypoint[7:14],
+                [right_gripper],
+            ])
+        else:
+            action = np.concatenate([
+                waypoint[:14], waypoint[14:16], [left_gripper, right_gripper]
+            ])
+        record = dict(action_metadata or {})
+        record.update(
+            record_type='action',
+            issued_at_unix=float(issued_at_unix),
+            issued_at_monotonic=float(issued_at_monotonic),
+            trajectory_frame_index=int(trajectory_index),
+            action=action.tolist(),
+        )
+        self._action_recorder.record(record)
 
     def run_setup(self):
         """Verify inference connectivity and adopt checkpoint task metadata."""
@@ -272,7 +601,8 @@ class Tron2InferenceRunner(BaseInferenceRunner):
         task_buffer = ''
         selected_task_id = None
         print('\n[TRON2 client idle] Type task ID and press Enter. '
-              'b=start, r=prepare pose, Ctrl+C=exit.')
+              'b=start, r=prepare pose, l=toggle action recording, '
+              'Ctrl+C=exit.')
         print('Task ID: ', end='', flush=True)
 
         while True:
@@ -336,14 +666,18 @@ class Tron2InferenceRunner(BaseInferenceRunner):
                 overwatch.info('Inference is already stopped; no action is '
                                'being generated or sent.')
                 continue
+            if command == 'l':
+                self._toggle_action_recording()
+                continue
             if key not in {' ', '\t'}:
                 overwatch.warning(
-                    'Unknown idle key %r. Use task ID + Enter, b, or r.', key)
+                    'Unknown idle key %r. Use task ID + Enter, b, r, or l.',
+                    key)
 
     def _monitor_active_keys(self, key_reader, stop_requested: threading.Event,
                              monitor_done: threading.Event,
                              monitor_errors: list[BaseException]):
-        """Accept only ``s`` while inference or a chunk is executing."""
+        """Accept stop and action-record toggles while inference runs."""
         from ..utils import initialize_overwatch
 
         overwatch = initialize_overwatch(__name__)
@@ -372,10 +706,12 @@ class Tron2InferenceRunner(BaseInferenceRunner):
                 elif command == 'b':
                     overwatch.info('Inference is already running. Press s to '
                                    'stop after the accepted chunk finishes.')
+                elif command == 'l':
+                    self._toggle_action_recording()
                 elif key not in {'\r', '\n', ' ', '\t'}:
                     overwatch.warning(
-                        'Key %r is ignored while inference is running; only s '
-                        'is active.', key)
+                        'Key %r is ignored while inference is running; use s '
+                        'to stop or l to toggle action recording.', key)
         except BaseException as exc:
             monitor_errors.append(exc)
             with self._chunk_accept_lock:
@@ -463,6 +799,7 @@ class Tron2InferenceRunner(BaseInferenceRunner):
 
         overwatch = initialize_overwatch(__name__)
         instruction = self._get_task_description(task_id)
+        self._active_task_id = task_id
         stop_requested = threading.Event()
         self._chunk_accept_lock = threading.Lock()
         monitor_done = threading.Event()
@@ -485,6 +822,7 @@ class Tron2InferenceRunner(BaseInferenceRunner):
             finally:
                 monitor_done.set()
                 monitor_thread.join(timeout=1.0)
+                self._active_task_id = None
                 if monitor_thread.is_alive():
                     raise RuntimeError(
                         'TRON2 active key monitor did not stop.')
@@ -504,7 +842,7 @@ class Tron2InferenceRunner(BaseInferenceRunner):
         del initial_instruction
         overwatch = initialize_overwatch(__name__)
         overwatch.info(
-            'Starting TRON2 keyboard control with %s. All b/s/r '
+            'Starting TRON2 keyboard control with %s. All b/s/r/l '
             'handling runs in this client terminal.',
             type(self).__name__)
         if self._use_remote:
@@ -623,7 +961,11 @@ class Tron2InferenceRunner(BaseInferenceRunner):
             # tron2_env Bridge/OpenPI state layout:
             # [left7, left_gripper, right7, right_gripper, head2].
             if self.action_layout == 'tron2_16':
-                qpos = state[:16].copy()
+                self._latest_head_position = state[16:18].astype(
+                    np.float32, copy=True)
+                qpos = (
+                    state.copy()
+                    if self.include_head_in_state else state[:16].copy())
             else:
                 # Preserve FluxVLA's historical tron2_18 training layout:
                 # [left7, right7, head2, left_gripper, right_gripper].
@@ -641,9 +983,13 @@ class Tron2InferenceRunner(BaseInferenceRunner):
             left_arm = np.array(arm_left.position)
             right_arm = np.array(arm_right.position)
             head_joints = np.array(head.position)
+            self._latest_head_position = head_joints.astype(
+                np.float32, copy=True)
             if self.action_layout == 'tron2_16':
-                qpos = np.concatenate(
-                    (left_arm, left_gripper, right_arm, right_gripper), axis=0)
+                qpos_parts = [left_arm, left_gripper, right_arm, right_gripper]
+                if self.include_head_in_state:
+                    qpos_parts.append(head_joints)
+                qpos = np.concatenate(qpos_parts, axis=0)
             else:
                 qpos = np.concatenate(
                     (left_arm, right_arm, head_joints, left_gripper,
@@ -722,7 +1068,11 @@ class Tron2InferenceRunner(BaseInferenceRunner):
 
     def _predict_action(self, inputs: dict):
         self._action_ctx.inference_start = time.time()
-        return super()._predict_action(inputs)
+        self._action_ctx.inference_start_monotonic = time.monotonic()
+        raw_action = super()._predict_action(inputs)
+        self._action_ctx.inference_elapsed = (
+            time.time() - self._action_ctx.inference_start)
+        return raw_action
 
     # Layouts:
     # - tron2_18: left7 + right7 + head2 + left_gripper + right_gripper
@@ -769,6 +1119,13 @@ class Tron2InferenceRunner(BaseInferenceRunner):
                                     self.GRIPPER_CLOSED, actions[:, col])
         return actions
 
+    def _async_execution_offset(self, ctx) -> float:
+        """Return the elapsed action steps for ordinary async execution."""
+        start = getattr(ctx, 'inference_start_monotonic', None)
+        if start is not None:
+            return (time.monotonic() - start) / self.dt
+        return (time.time() - ctx.inference_start) / self.dt
+
     def _execute_actions(self, actions: np.ndarray, rate):
         """Execute a chunk of dual-arm robot actions.
 
@@ -781,10 +1138,15 @@ class Tron2InferenceRunner(BaseInferenceRunner):
 
         if self.async_execution and self._prev_ctx is not None:
             ctx.action_timestamp = ctx.inference_start
-            offset = (time.time() - ctx.action_timestamp) / self.dt
+            ctx.action_timestamp_monotonic = getattr(
+                ctx, 'inference_start_monotonic', time.monotonic())
+            offset = self._async_execution_offset(ctx)
+            ctx.execution_offset_steps = float(offset)
             actions = resample_remaining(actions, offset)
         else:
             ctx.action_timestamp = time.time()
+            ctx.action_timestamp_monotonic = time.monotonic()
+            ctx.execution_offset_steps = 0.0
             if self.execute_horizon is not None:
                 actions = actions[:self.execute_horizon]
 
@@ -797,7 +1159,7 @@ class Tron2InferenceRunner(BaseInferenceRunner):
                   f'first_action={actions[0].tolist()}')
             return
 
-        self.ros_operator.execute_trajectory(
+        execute_kwargs = dict(
             left_arm_trajectory=parts['left_arm'],
             right_arm_trajectory=parts['right_arm'],
             left_gripper_trajectory=parts['left_gripper'],
@@ -805,6 +1167,10 @@ class Tron2InferenceRunner(BaseInferenceRunner):
             head_trajectory=parts['head'],
             dt=self.dt,
             async_exec=self.async_execution)
+        if self._action_recording_supported:
+            execute_kwargs['action_metadata'] = (
+                self._trajectory_action_metadata(len(actions)))
+        self.ros_operator.execute_trajectory(**execute_kwargs)
 
         if self.async_execution and self.execute_horizon is not None:
             time.sleep(self.execute_horizon * self.dt)
@@ -818,8 +1184,20 @@ class Tron2InferenceRunner(BaseInferenceRunner):
 
         try:
             try:
-                if hasattr(self.ros_operator, 'stop_trajectory'):
-                    self.ros_operator.stop_trajectory()
+                try:
+                    if hasattr(self.ros_operator, 'stop_trajectory'):
+                        self.ros_operator.stop_trajectory()
+                finally:
+                    path, count, error = self._action_recorder.stop()
+                    if path is not None:
+                        if error is None:
+                            overwatch.info(
+                                'Action recording finalized: %d actions in '
+                                '%s', count, path)
+                        else:
+                            overwatch.error(
+                                'Action recording ended with writer error '
+                                '(%s): %s', error, path)
             finally:
                 if hasattr(self.ros_operator, 'close'):
                     self.ros_operator.close()

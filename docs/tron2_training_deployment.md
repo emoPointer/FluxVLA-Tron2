@@ -233,7 +233,11 @@ operator=dict(
     ws_accid=None,
     movej_duration=2.0,
     servoj_publish_rate=300.0,
-    max_servoj_step_rad=0.2,
+    recovery_blend_frames=6,
+    chunk_boundary_blend_enabled=False,
+    chunk_boundary_blend_frames=6,
+    chunk_boundary_blend_scope='arm',
+    max_servoj_step_rad=0.5,
     max_state_source_mismatch_rad=None,
     lock_head=True,
     max_head_hold_error_rad=0.05,
@@ -259,7 +263,19 @@ ws_accid=None
 account ID. Do not set `ws_accid` to a non-`None` value. Bridge observations
 use `wss://10.192.1.4`; prepare poses use MoveJ, while policy actions use the
 separate robot WebSocket and a measured-state-seeded 300 Hz ServoJ publisher.
-Policy waypoints are fed at `publish_rate=30` Hz.
+Policy waypoints are fed at `publish_rate=30` Hz. If the previous ServoJ
+trajectory drains and the publisher is holding its final target, the next
+valid trajectory blends from that held command for
+`recovery_blend_frames=6` policy frames (about 0.2 seconds at 30 Hz). Normal
+asynchronous replacement of a trajectory that is still active does not
+trigger recovery blending. The separate
+optional `chunk_boundary_blend_enabled=True` path snapshots the old
+trajectory's unissued actions and smoothstep-blends them with the first six
+aligned actions of the replacement chunk. It is currently disabled with
+`chunk_boundary_blend_enabled=False`; the separate six-frame recovery blend
+remains enabled. When boundary blending is enabled, the current `arm` scope
+leaves gripper commands unfiltered and does not change the locked head. MoveJ
+reset clears the saved state for both blend paths.
 
 ## 5. Fine-Tune PI0.5 with LoRA
 
@@ -526,20 +542,58 @@ computer. Do not start the ZMQ server, SSH tunnel, or remote client:
 ```bash
 python scripts/inference.py \
   --config configs/pi05/pi05_paligemma_tron2_lora_rtc_local_inference.py \
-  --ckpt-path /path/to/merged-rtc-checkpoint.safetensors \
-  --cfg-options inference.dry_run=True
+  --ckpt-path /path/to/merged-rtc-checkpoint.safetensors
 ```
 
-This config uses `Tron2RTCInferenceRunner`, `method='prefix'`, a 50-frame chunk
-matching the model horizon, and direct Bridge/control WebSocket connections.
-The `b`/`s`/`r` keyboard state machine runs in this GPU-computer terminal.
-After `s`, the accepted asynchronous trajectory drains before the runner
-reports idle, so idle-only `r` cannot race ServoJ with the MoveJ prepare pose.
+This config uses `Tron2RTCInferenceRunner`, `method='prefix'`, and a 50-frame
+chunk matching the model horizon. `delay=6` seeds the first request. Subsequent
+dynamic delays follow the public client's measured latency converted with
+`ceil(latency / policy_period)` and the recent ten-sample P95. The selected
+fold-clothes checkpoint supports prefixes `{0, 5, 10, 19}`; the FluxVLA
+adapter rounds each dynamic delay upward to the first supported value and
+clamps values above 19 with a warning.
 
-The current training recipe samples prefixes in `[0, 10)`. At 30 Hz this spans
-less than 0.333 seconds. Measure the new checkpoint's end-to-end inference
-latency in dry run before real execution; the runner warns if the dynamically
-required prefix is outside the train-time range.
+Execution follows the public TRON2 ActionQueue client. A persistent 30 Hz
+consumer starts the next inference when the queue reaches
+`H - execution_horizon` actions. The consumer continues issuing the old queue
+during inference. When the new chunk returns, the runner atomically replaces
+the queue with `new_actions[actual_consumed:]`, where `actual_consumed` is the
+consumer-index difference observed while inference was in flight. The 30 Hz
+consumer and the 300 Hz `MotionController` are not restarted at chunk
+boundaries. The config constructs the pinned public `Tron2Env` directly, so
+Bridge images, robot-WebSocket state, `step()` action extraction, gripper
+clipping, current-head passthrough, interpolation, and ServoJ publication are
+owned by upstream code. If the queue drains, the latest ServoJ target is held;
+recovery uses the public client's six-frame blend.
+
+The runner uses direct Bridge/control WebSocket connections. The
+`b`/`s`/`r`/`l` keyboard state machine runs in this GPU-computer terminal.
+After `s`, producer and consumer stop with the public-client semantics and the
+300 Hz controller holds its latest target. Idle-only `r` disconnects that
+controller before MoveJ, so the two command modes cannot race.
+
+The checkpoint training range is `[0, 20)`. The runner logs once if the recent
+P95 reaches 20 frames or more; queue replacement still follows the actual
+consumer index.
+
+### Issued-action recording
+
+Both the RTC and non-RTC runners accept `l` while idle or running. The first
+press starts a JSONL session and the next press flushes and closes it. The
+default destination is
+`work_dirs/action_records/tron2_actions_<rtc|non_rtc>_<timestamp>_<pid>.jsonl`.
+In remote non-RTC mode this path is on the robot-side client; in single-process
+RTC mode it is on the GPU computer.
+
+Each action row contains issue timestamps, task ID, instruction, trajectory
+and frame indices, RTC state, the effective prefix length, and the complete
+action vector. The callback is placed after the validated policy waypoint is
+accepted by the ServoJ controller, so preempted old-chunk tails are excluded.
+These are 30 Hz policy-rate waypoints after configured blending, not the 300 Hz
+interpolated publisher samples. A background writer keeps filesystem I/O out
+of the ServoJ feeder. Dry run produces no action rows because it sends no robot
+commands. RTC rows identify the ActionQueue scheduler, fixed model prefix,
+source action index, and queue size after each issued action.
 
 ## 11. Move to the Prepare Pose
 
@@ -547,7 +601,7 @@ While the client is idle, press `r` to run the same configured prepare-pose
 sequence previously exposed as task ID `0`:
 
 ```text
-[TRON2 client idle] Type task ID and press Enter. b=start, r=prepare pose.
+[TRON2 client idle] Type task ID and press Enter. b=start, r=prepare pose, l=toggle action recording.
 ```
 
 `r` is ignored while a task is running; press `s`, wait until the client
@@ -573,8 +627,9 @@ For first deployment on a new robot:
 - verify the selected checkpoint task ID before pressing `b`;
 - keep object placement conservative;
 - verify gripper open/close convention before full-speed runs;
-- keep `max_servoj_step_rad=0.2` until recorded trajectories justify a tighter
-  deployment-specific value.
+- the current PI0.5 LoRA deployment uses `max_servoj_step_rad=0.5`; this only
+  relaxes the adjacent-target delta guard and does not disable finite-value,
+  joint-limit, head-lock, or ServoJ interpolation checks.
 
 ## 13. Troubleshooting
 
@@ -658,9 +713,22 @@ The most important runtime switches are:
 | ----------------------------- | ---------------------------------------- |
 | `inference.dry_run=True`      | full inference flow, no robot action     |
 | `inference.dry_run=False`     | execute returned actions on the robot    |
+| `inference.action_record_dir` | JSONL directory toggled by the `l` key   |
+| `inference.include_head_in_state` | keep the training-time 18-D measured proprio while commands remain 16-D |
+| `inference.rtc_config.delay` | initial RTC delay; subsequent model prefixes use measured P95 |
+| `inference.rtc_config.execution_horizon` | fixed `s`; starts inference when queue size reaches `H-s` |
+| `inference.rtc_config.recovery_blend_frames` | ActionQueue underflow-recovery blend frames |
+| `inference.rtc_config.prefix_len` | fixed trained model prefix; ActionQueue still crops by actual consumption |
+| `inference.rtc_config.prefix_action_dim` | feed back the 16 supervised action dimensions before appending measured head conditioning |
+| `inference.rtc_config.prefix_head_from_observation` | normalize the measured locked head with checkpoint action statistics for dimensions 16--17 |
+| `inference.rtc_config.action_postprocess.enabled` | optional post-merge boundary/EMA smoothing (disabled by default) |
 | `inference.operator.bridge_host` | TRON2 Bridge WebSocket origin        |
 | `inference.operator.ws_port`  | Tron2 WebSocket controller port          |
 | `inference.operator.servoj_publish_rate` | ServoJ background rate (300 Hz) |
+| `inference.operator.recovery_blend_frames` | ServoJ stream-recovery blend frames (default 6; 0 disables) |
+| `inference.operator.chunk_boundary_blend_enabled` | active-chunk smoothstep boundary blending (currently disabled) |
+| `inference.operator.chunk_boundary_blend_frames` | active chunk boundary blend frames (currently 6) |
+| `inference.operator.chunk_boundary_blend_scope` | blend scope: `arm`, `gripper`, or `all` |
 | `inference.operator.max_servoj_step_rad` | Per-waypoint delta guard (rad) |
 | `inference.operator.max_state_source_mismatch_rad=None` | disable duplicate Bridge/control mismatch blocking |
 | `inference.operator.lock_head` | reject policy head targets and hold measured head |

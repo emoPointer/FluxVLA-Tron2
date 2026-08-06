@@ -284,7 +284,11 @@ operator=dict(
     ws_accid=None,
     movej_duration=2.0,
     servoj_publish_rate=300.0,
-    max_servoj_step_rad=0.2,
+    recovery_blend_frames=6,
+    chunk_boundary_blend_enabled=True,
+    chunk_boundary_blend_frames=6,
+    chunk_boundary_blend_scope='arm',
+    max_servoj_step_rad=0.5,
     max_state_source_mismatch_rad=None,
     lock_head=True,
     max_head_hold_error_rad=0.05,
@@ -307,7 +311,12 @@ ws_accid=None
 `Tron2EnvOperator` 使用公开的 `tron2_env` runtime 自动识别账号 ID，不要把
 `ws_accid` 设置为非 `None`。Bridge 观测走 `wss://10.192.1.4`；prepare pose
 使用 MoveJ，策略动作通过独立的机器人 WebSocket 和从实测状态初始化的 300 Hz
-ServoJ 发布器执行。PI0.5 LoRA 以 `publish_rate=30` Hz 喂入策略路点。
+ServoJ 发布器执行。PI0.5 LoRA 以 `publish_rate=30` Hz 喂入策略路点。若上一条
+ServoJ 轨迹已经耗尽、发布器正在保持最后目标，下一条有效轨迹会在前
+`recovery_blend_frames=6` 个策略帧（30 Hz 下约 0.2 秒）内从保持目标线性渐变到
+新动作；正常异步轨迹尚未耗尽时的 chunk 替换不会触发该恢复渐变。chunk 边界
+smoothstep 混合当前已通过 `chunk_boundary_blend_enabled=False` 关闭；独立的断流
+恢复 6 帧渐变仍然保留。
 
 ## 5. 使用 LoRA 微调 PI0.5
 
@@ -513,7 +522,8 @@ Task ID: 6
 Press b to start, or type another task ID and press Enter.
 ```
 
-现在不再输入 repeat time。按键状态机在机器人 Power Computing Module 上
+现在不再输入 repeat time。按 `l` 可随时打开或关闭实际发送 action 的记录。
+按键状态机在机器人 Power Computing Module 上
 运行，GPU 服务器只处理推理请求。dry run 空闲时按 `r` 会打印并跳过
 prepare pose。
 
@@ -568,26 +578,57 @@ ZMQ server、SSH tunnel 或机器人侧 remote client：
 ```bash
 python scripts/inference.py \
   --config configs/pi05/pi05_paligemma_tron2_lora_rtc_local_inference.py \
-  --ckpt-path /path/to/merged-rtc-checkpoint.safetensors \
-  --cfg-options inference.dry_run=True
+  --ckpt-path /path/to/merged-rtc-checkpoint.safetensors
 ```
 
 该配置使用 `Tron2RTCInferenceRunner`、`method='prefix'` 和与模型 horizon
-一致的 50 步 chunk，并从 GPU 电脑直接连接观测/控制 WebSocket。`b/s/r` 按键
-状态机也运行在这个终端。按 `s` 后，runner 会等待已经接收的异步轨迹执行完才
-报告 idle，因此只能在 idle 使用的 `r` 不会让 ServoJ 和 prepare-pose MoveJ
-发生竞争。
+一致的 50 步 chunk。官方部署用 `delay=6` 启动；随后将推理耗时向上取整为
+策略帧，并使用最近 10 次的 P95 作为下一次动态 `d`。叠衣服 18k 权重只支持
+离散 prefix `{0,5,9,19}`，所以模型适配层把动态 `d` 向上量化到第一个不小于
+它的支持值；`d>19` 时使用 19 并打印警告。
 
-当前训练配置采样的 prefix 范围是 `[0, 10)`；30 Hz 下覆盖时间不足
-0.333 秒。真实执行前必须先用新 RTC 权重测量端到端推理耗时；如果动态需要的
-prefix 超出训练范围，runner 会打印一次警告。
+执行侧与公开的 TRON2 ActionQueue 客户端一致：长期运行的 30 Hz consumer 在队列
+剩余 `H - execution_horizon` 步时触发新推理，推理期间继续消费旧队列；新 chunk
+返回后，根据推理期间 consumer 实际前进的索引 `actual_consumed`，原子替换成
+`new_actions[actual_consumed:]`。配置直接构造固定版本的公开 `Tron2Env`；Bridge
+图像、机器人 WebSocket 状态、`env.step()`、夹爪裁剪、当前头部透传、300 Hz
+线性插值和 ServoJ 发布均由上游运行时负责。本项目不再重写这段执行逻辑。
+chunk 切换不会重启 30 Hz consumer 或 300 Hz `MotionController`。队列断流时
+保持最后 ServoJ 目标，恢复后使用公开客户端的 6 帧渐变。
+
+进程从 GPU 电脑直接连接观测/控制 WebSocket，`b/s/r/l` 按键状态机也运行在
+这个终端。按 `s` 后，runner 按公开客户端语义停止 producer/consumer，300 Hz
+控制器保持最后目标；回到 idle 后才能按 `r`。`r` 会关闭并重建公开
+`Tron2Env`，由其原生初始化流程执行 MoveJ；配置不发送头部初始化目标。
+
+日志同时打印 `d`、`prefix`、`meas` 和 `used`。其中 `d` 是下一次模型请求的
+动态延时，`prefix` 是离散量化结果，`meas` 是本次实测耗时帧数，`used` 是
+ActionQueue 根据真实 consumer 索引采用的替换位置。
+
+### Action 记录开关
+
+RTC 与非 RTC runner 都支持 `l` 键：第一次按下开始记录，再按一次停止并完整
+落盘。可以在 idle 或任务运行中切换；`s`、`r` 的行为不变。默认输出目录是：
+
+```text
+work_dirs/action_records/tron2_actions_<rtc|non_rtc>_<时间>_<PID>.jsonl
+```
+
+远程无 RTC 模式的文件生成在运行 client 的机器人 Power Computing Module；
+单进程 RTC 模式的文件生成在运行模型的 GPU 电脑。每个 action 记录包含时间戳、
+任务 ID、prompt、trajectory/frame 序号、RTC 开关、实际 `prefix_len` 和完整 action
+向量。记录的是通过校验和恢复渐变后、实际交给 ServoJ 的 30 Hz 策略路点，不是
+300 Hz 插值采样；RTC 替换时未发送的旧 chunk 尾部不会写入。写盘使用独立线程，
+不会在 ServoJ feeder 中执行磁盘 I/O。dry run 不发送动作，因此不会产生 action
+行。RTC action 行还会记录 ActionQueue 调度方式、动态模型 prefix、来源 action
+索引和发送后的队列长度，便于检查切换边界。
 
 ## 11. 进入初始位姿
 
 客户端空闲时按 `r`，会执行原 task ID `0` 使用的同一套 prepare pose：
 
 ```text
-[TRON2 client idle] Type task ID and press Enter. b=start, r=prepare pose.
+[TRON2 client idle] Type task ID and press Enter. b=start, r=prepare pose, l=toggle action recording.
 ```
 
 任务运行中按 `r` 无效；必须先按 `s`，等客户端回到 idle 后才能按 `r`。
@@ -609,7 +650,8 @@ WebSocket，但它仍然不是机器人急停：不会自动卸力，也不能�
 - 按 `b` 前再次确认当前权重和所选任务 ID；
 - 物体摆放保守；
 - 完整运行前先确认夹爪开合约定；
-- 在有实测轨迹支持更严格阈值前，保持 `max_servoj_step_rad=0.2`。
+- 当前 PI0.5 LoRA 部署使用 `max_servoj_step_rad=0.5`；这只放宽相邻目标
+  跳变上限，不会关闭有限值、关节范围、头部锁定或 ServoJ 插值检查。
 
 ## 13. 常见问题
 
@@ -690,8 +732,21 @@ scripts/remote_inference_client.sh
 | ----------------------------- | -------------------------------- |
 | `inference.dry_run=True`      | 完成推理链路，但不执行机器人动作 |
 | `inference.dry_run=False`     | 在机器人上执行返回动作           |
+| `inference.action_record_dir` | `l` 键 action JSONL 输出目录      |
+| `inference.include_head_in_state` | 模型观测保留训练时的18维 proprio，控制动作仍为16维 |
+| `inference.rtc_config.delay` | 首次 RTC 请求使用的初始 delay；之后使用实测 P95 |
+| `inference.rtc_config.execution_horizon` | 固定 `s`，队列到 `H-s` 时触发推理 |
+| `inference.rtc_config.recovery_blend_frames` | ActionQueue 断流恢复渐变帧数 |
+| `inference.rtc_config.prefix_len` | 固定模型 RTC 条件长度；队列仍按真实消费步数裁剪 |
+| `inference.rtc_config.prefix_action_dim` | RTC 回灌受监督的前 16 维动作，再追加按训练统计归一化的实测头部 |
+| `inference.rtc_config.prefix_head_from_observation` | 使用实测锁定头部填充训练时的 action 第 16–17 维 |
+| `inference.rtc_config.action_postprocess.enabled` | 可选边界/EMA后处理（默认关闭） |
 | `inference.operator.ws_port`  | Tron2 WebSocket 控制端口         |
 | `inference.operator.servoj_publish_rate` | ServoJ 后台发布频率（300 Hz） |
+| `inference.operator.recovery_blend_frames` | ServoJ 断流恢复渐变帧数（默认 6，0 为关闭） |
+| `inference.operator.chunk_boundary_blend_enabled` | 是否开启活动 chunk 边界 smoothstep 混合 |
+| `inference.operator.chunk_boundary_blend_frames` | 边界混合帧数（当前 6） |
+| `inference.operator.chunk_boundary_blend_scope` | 混合范围：`arm`、`gripper` 或 `all` |
 | `inference.operator.max_servoj_step_rad` | 相邻路点变化上限（rad） |
 | `inference.operator.max_state_source_mismatch_rad=None` | 关闭重复的 Bridge/控制反馈差异阻断 |
 | `inference.operator.lock_head` | 拒绝策略头部目标并保持实测头部位置 |

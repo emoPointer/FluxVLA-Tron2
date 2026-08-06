@@ -22,6 +22,7 @@ topics.
 
 from __future__ import annotations
 
+import logging
 import threading
 import time
 from typing import Any, Dict, List, Optional, Tuple
@@ -30,6 +31,8 @@ from urllib.parse import urlparse
 import numpy as np
 
 from fluxvla.engines.utils.root import OPERATORS
+
+logger = logging.getLogger(__name__)
 
 
 @OPERATORS.register_module()
@@ -56,6 +59,17 @@ class Tron2EnvOperator:
         bridge_startup_timeout: Seconds to wait for the first complete Bridge
             observation during construction.
         servoj_publish_rate: Background ServoJ publication rate in Hz.
+        recovery_blend_frames: Number of policy frames used to blend from the
+            held ServoJ target after the previous trajectory has drained. Zero
+            disables recovery blending. Normal asynchronous preemption does
+            not trigger this path.
+        chunk_boundary_blend_enabled: Smooth normal asynchronous chunk
+            replacements with a smoothstep-weighted blend of the old unissued
+            trajectory and the new trajectory.
+        chunk_boundary_blend_frames: Maximum number of replacement-boundary
+            policy frames to blend.
+        chunk_boundary_blend_scope: Components to blend: ``arm``, ``gripper``,
+            or ``all``.
         state_polling_rate: Robot-state polling rate used by ``tron2_env``.
         connection_timeout: Seconds to wait for the WebSocket connection.
         state_timeout: Seconds to wait for the measured state used to seed and
@@ -104,6 +118,10 @@ class Tron2EnvOperator:
                  bridge_observation_timeout: float = 2.0,
                  bridge_startup_timeout: float = 10.0,
                  servoj_publish_rate: float = 300.0,
+                 recovery_blend_frames: int = 6,
+                 chunk_boundary_blend_enabled: bool = False,
+                 chunk_boundary_blend_frames: int = 6,
+                 chunk_boundary_blend_scope: str = 'arm',
                  state_polling_rate: float = 200.0,
                  connection_timeout: float = 5.0,
                  state_timeout: float = 2.0,
@@ -132,6 +150,24 @@ class Tron2EnvOperator:
                 'ws_accid must be None.')
 
         self._validate_positive('servoj_publish_rate', servoj_publish_rate)
+        if (isinstance(recovery_blend_frames, bool)
+                or not isinstance(recovery_blend_frames, int)
+                or recovery_blend_frames < 0):
+            raise ValueError('recovery_blend_frames must be a non-negative '
+                             f'integer; got {recovery_blend_frames!r}.')
+        if not isinstance(chunk_boundary_blend_enabled, bool):
+            raise ValueError('chunk_boundary_blend_enabled must be a bool; '
+                             f'got {chunk_boundary_blend_enabled!r}.')
+        if (isinstance(chunk_boundary_blend_frames, bool)
+                or not isinstance(chunk_boundary_blend_frames, int)
+                or chunk_boundary_blend_frames < 0):
+            raise ValueError(
+                'chunk_boundary_blend_frames must be a non-negative integer; '
+                f'got {chunk_boundary_blend_frames!r}.')
+        if chunk_boundary_blend_scope not in {'arm', 'gripper', 'all'}:
+            raise ValueError(
+                "chunk_boundary_blend_scope must be 'arm', 'gripper', or "
+                f"'all'; got {chunk_boundary_blend_scope!r}.")
         self._validate_positive('state_polling_rate', state_polling_rate)
         self._validate_positive('connection_timeout', connection_timeout)
         self._validate_positive('state_timeout', state_timeout)
@@ -184,6 +220,10 @@ class Tron2EnvOperator:
         self.bridge_observation_timeout = float(bridge_observation_timeout)
         self.bridge_startup_timeout = float(bridge_startup_timeout)
         self.servoj_publish_rate = float(servoj_publish_rate)
+        self.recovery_blend_frames = recovery_blend_frames
+        self.chunk_boundary_blend_enabled = chunk_boundary_blend_enabled
+        self.chunk_boundary_blend_frames = chunk_boundary_blend_frames
+        self.chunk_boundary_blend_scope = chunk_boundary_blend_scope
         self.state_polling_rate = float(state_polling_rate)
         self.connection_timeout = float(connection_timeout)
         self.state_timeout = float(state_timeout)
@@ -216,6 +256,15 @@ class Tron2EnvOperator:
         self._trajectory_error = None
         self._traj_thread = None
         self._traj_stop_event = threading.Event()
+        self._last_servoj_waypoint = None
+        self._last_left_gripper = None
+        self._last_right_gripper = None
+        self._recovery_blend_pending = False
+        self._active_servoj_waypoints = None
+        self._active_left_gripper = None
+        self._active_right_gripper = None
+        self._active_next_index = 0
+        self._issued_action_callback = None
 
         if self.connect_observation:
             self._start_bridge_observation()
@@ -454,11 +503,76 @@ class Tron2EnvOperator:
         transport = self._transport
         self._motion_controller = None
         self._transport = None
+        self._clear_recovery_state_locked()
 
         if controller is not None:
             controller.disconnect()
         elif transport is not None:
             transport.disconnect()
+
+    def _clear_recovery_state_locked(self) -> None:
+        """Forget ServoJ hold state after MoveJ or a transport restart."""
+        self._last_servoj_waypoint = None
+        self._last_left_gripper = None
+        self._last_right_gripper = None
+        self._recovery_blend_pending = False
+        self._clear_active_trajectory_locked()
+
+    def _clear_active_trajectory_locked(self) -> None:
+        self._active_servoj_waypoints = None
+        self._active_left_gripper = None
+        self._active_right_gripper = None
+        self._active_next_index = 0
+
+    def set_issued_action_callback(self, callback) -> None:
+        """Set a non-blocking observer for issued policy-rate waypoints."""
+        if callback is not None and not callable(callback):
+            raise ValueError('Issued-action callback must be callable or '
+                             f'None; got {callback!r}.')
+        with self._control_lock:
+            self._issued_action_callback = callback
+
+    def _notify_issued_action(self, *, waypoint, left_gripper, right_gripper,
+                              trajectory_index, issued_at_unix,
+                              issued_at_monotonic, action_metadata) -> None:
+        with self._control_lock:
+            callback = self._issued_action_callback
+        if callback is None:
+            return
+        try:
+            callback(
+                waypoint=waypoint.copy(),
+                left_gripper=float(left_gripper),
+                right_gripper=float(right_gripper),
+                trajectory_index=int(trajectory_index),
+                issued_at_unix=float(issued_at_unix),
+                issued_at_monotonic=float(issued_at_monotonic),
+                action_metadata=dict(action_metadata or {}),
+            )
+        except Exception:
+            logger.exception('Issued-action recorder callback failed; action '
+                             'execution continues and recording is disabled.')
+            with self._control_lock:
+                if self._issued_action_callback is callback:
+                    self._issued_action_callback = None
+
+    def _snapshot_active_leftover_locked(self):
+        if (self._active_servoj_waypoints is None
+                or self._active_left_gripper is None
+                or self._active_right_gripper is None):
+            return None
+        index = min(self._active_next_index,
+                    len(self._active_servoj_waypoints))
+        # A feeder that was stopped before issuing its first waypoint has no
+        # executable history, so its unsent plan must not influence the next
+        # chunk boundary.
+        if index <= 0 or index >= len(self._active_servoj_waypoints):
+            return None
+        return (
+            self._active_servoj_waypoints[index:].copy(),
+            self._active_left_gripper[index:].copy(),
+            self._active_right_gripper[index:].copy(),
+        )
 
     @staticmethod
     def _validate_arm_target(left, right) -> np.ndarray:
@@ -509,6 +623,10 @@ class Tron2EnvOperator:
 
         self.stop_trajectory()
         with self._control_lock:
+            # MoveJ establishes a new measured starting point. A future ServoJ
+            # trajectory must seed from that state rather than an old hold
+            # target captured before reset.
+            self._clear_recovery_state_locked()
             # A ServoJ publisher must never run concurrently with MoveJ.
             if self._motion_controller is not None:
                 self._disconnect_control_locked()
@@ -598,8 +716,7 @@ class Tron2EnvOperator:
                 np.isfinite(current)):
             raise ValueError('tron2_env must provide one finite 18-dim '
                              f'state; got {current.shape}.')
-        current_servoj = np.concatenate(
-            [current[:7], current[8:15], current[16:18]])
+        current_servoj = self._state_to_servoj(current)
 
         if (check_state_source
                 and self.max_state_source_mismatch_rad is not None):
@@ -667,23 +784,175 @@ class Tron2EnvOperator:
                                  f'{int(waypoint)}, joint {int(joint)}: '
                                  f'{waypoints[waypoint, joint]:.6f}.')
 
-        if self.max_servoj_step_rad is not None:
-            points = np.concatenate([current_servoj[None], waypoints], axis=0)
-            deltas = np.abs(np.diff(points, axis=0))
-            max_index = np.unravel_index(np.argmax(deltas), deltas.shape)
-            max_delta = float(deltas[max_index])
-            if max_delta > self.max_servoj_step_rad:
-                current_value = float(points[max_index[0], max_index[1]])
-                target_value = float(points[max_index[0] + 1, max_index[1]])
-                raise ValueError(
-                    'ServoJ waypoint delta exceeds safety limit: '
-                    f'{max_delta:.6f} rad at transition {max_index[0]}, '
-                    f'joint {max_index[1]} > '
-                    f'{self.max_servoj_step_rad:.6f} rad '
-                    f'(current={current_value:.6f}, '
-                    f'target={target_value:.6f}).')
+        self._validate_servoj_waypoint_deltas(current_servoj, waypoints)
 
         return waypoints, left_gripper, right_gripper
+
+    @staticmethod
+    def _state_to_servoj(state: np.ndarray) -> np.ndarray:
+        return np.concatenate([state[:7], state[8:15], state[16:18]])
+
+    def _validate_servoj_waypoint_deltas(self, current_servoj: np.ndarray,
+                                         waypoints: np.ndarray) -> None:
+        if self.max_servoj_step_rad is None or len(waypoints) == 0:
+            return
+        points = np.concatenate([current_servoj[None], waypoints], axis=0)
+        deltas = np.abs(np.diff(points, axis=0))
+        max_index = np.unravel_index(np.argmax(deltas), deltas.shape)
+        max_delta = float(deltas[max_index])
+        if max_delta > self.max_servoj_step_rad:
+            current_value = float(points[max_index[0], max_index[1]])
+            target_value = float(points[max_index[0] + 1, max_index[1]])
+            raise ValueError(
+                'ServoJ waypoint delta exceeds safety limit: '
+                f'{max_delta:.6f} rad at transition {max_index[0]}, '
+                f'joint {max_index[1]} > '
+                f'{self.max_servoj_step_rad:.6f} rad '
+                f'(current={current_value:.6f}, '
+                f'target={target_value:.6f}).')
+
+    def _apply_recovery_blend(self, waypoints: np.ndarray,
+                              left_gripper: np.ndarray,
+                              right_gripper: np.ndarray):
+        """Blend a recovered trajectory from the last held command."""
+        if (not self._recovery_blend_pending or self.recovery_blend_frames == 0
+                or len(waypoints) == 0 or self._last_servoj_waypoint is None
+                or self._last_left_gripper is None
+                or self._last_right_gripper is None):
+            return waypoints, left_gripper, right_gripper, 0
+
+        count = min(self.recovery_blend_frames, len(waypoints))
+        alpha = (
+            np.arange(1, count + 1, dtype=np.float64) /
+            self.recovery_blend_frames)
+        blended_waypoints = waypoints.copy()
+        blended_left = left_gripper.copy()
+        blended_right = right_gripper.copy()
+        blended_waypoints[:count] = (
+            (1.0 - alpha[:, None]) * self._last_servoj_waypoint[None] +
+            alpha[:, None] * blended_waypoints[:count])
+        blended_left[:count] = ((1.0 - alpha) * self._last_left_gripper +
+                                alpha * blended_left[:count])
+        blended_right[:count] = ((1.0 - alpha) * self._last_right_gripper +
+                                 alpha * blended_right[:count])
+        return blended_waypoints, blended_left, blended_right, count
+
+    def _apply_chunk_boundary_blend(self, waypoints: np.ndarray,
+                                    left_gripper: np.ndarray,
+                                    right_gripper: np.ndarray, old_leftover):
+        """Smooth an active chunk replacement with old unissued actions."""
+        if (not self.chunk_boundary_blend_enabled
+                or self.chunk_boundary_blend_frames == 0
+                or old_leftover is None or len(waypoints) == 0):
+            return waypoints, left_gripper, right_gripper, 0
+
+        old_waypoints, old_left, old_right = old_leftover
+        count = min(self.chunk_boundary_blend_frames, len(waypoints),
+                    len(old_waypoints))
+        if count == 0:
+            return waypoints, left_gripper, right_gripper, 0
+
+        u = np.arange(1, count + 1, dtype=np.float64) / (count + 1)
+        alpha = u * u * (3.0 - 2.0 * u)
+        blended_waypoints = waypoints.copy()
+        blended_left = left_gripper.copy()
+        blended_right = right_gripper.copy()
+        if self.chunk_boundary_blend_scope in {'arm', 'all'}:
+            waypoint_dims = (
+                slice(None) if self.chunk_boundary_blend_scope == 'all' else
+                slice(0, 2 * self._ARM_DIM))
+            blended_waypoints[:count, waypoint_dims] = (
+                (1.0 - alpha[:, None]) * old_waypoints[:count, waypoint_dims] +
+                alpha[:, None] * blended_waypoints[:count, waypoint_dims])
+        if self.chunk_boundary_blend_scope in {'gripper', 'all'}:
+            blended_left[:count] = ((1.0 - alpha) * old_left[:count] +
+                                    alpha * blended_left[:count])
+            blended_right[:count] = ((1.0 - alpha) * old_right[:count] +
+                                     alpha * blended_right[:count])
+        return blended_waypoints, blended_left, blended_right, count
+
+    def begin_waypoint_stream(self) -> None:
+        """Prepare for a persistent policy-rate ActionQueue consumer.
+
+        A queue consumer calls :meth:`execute_waypoint` at a stable policy
+        rate.  It must not compete with an older trajectory feeder, but it
+        deliberately keeps the existing MotionController alive so its 300 Hz
+        interpolation/publish phase is not restarted at chunk boundaries.
+        """
+        self.stop_trajectory()
+        with self._control_lock:
+            self._recovery_blend_pending = False
+            self._clear_active_trajectory_locked()
+
+    def execute_waypoint(self,
+                         left_arm,
+                         right_arm,
+                         left_gripper: float,
+                         right_gripper: float,
+                         head=None,
+                         dt: float = 1.0 / 30.0,
+                         action_metadata=None,
+                         trajectory_index: int = 0) -> None:
+        """Execute one action using the upstream ``Tron2Env.step`` path.
+
+        The action extraction, gripper clipping, current-head passthrough, and
+        no-argument ``command_joints`` call below intentionally mirror
+        ``tron2_env.env.Tron2Env.step`` at commit
+        ``5b7b145229416f3731f61657e6fa71c89c37bc9d``. In particular, this path
+        does not poll measured state or run the custom trajectory guards at
+        every 30 Hz policy tick; ``MotionController`` owns interpolation and
+        publishes the latest target at 300 Hz.
+        """
+        self._validate_positive('dt', dt)
+        left = np.asarray(left_arm, dtype=np.float64).reshape(-1)
+        right = np.asarray(right_arm, dtype=np.float64).reshape(-1)
+        action = np.concatenate(
+            [left, [float(left_gripper)], right, [float(right_gripper)]])
+        if head is not None:
+            action = np.concatenate(
+                [action,
+                 np.asarray(head, dtype=np.float64).reshape(-1)])
+        if len(action) not in (16, 18):
+            raise ValueError(
+                f'TRON2 action must contain 16 or 18 values; got {len(action)}.'
+            )
+
+        with self._control_lock:
+            if self._traj_thread is not None and self._traj_thread.is_alive():
+                raise RuntimeError('A trajectory feeder is active while the '
+                                   'RTC waypoint stream is running.')
+            controller = self._start_motion_controller_locked(dt)
+
+            arm_action = np.concatenate([action[:7], action[8:15]])
+            if len(action) >= 18:
+                head_action = action[16:18]
+            else:
+                head_action = controller.get_head_position()
+            full_servo_action = np.concatenate([arm_action, head_action])
+
+            gripper_action = np.clip(
+                np.asarray([action[7], action[15]]) * 100.0, 0.0, 100.0)
+            controller.set_gripper(
+                left_opening=float(gripper_action[0]),
+                right_opening=float(gripper_action[1]),
+            )
+            controller.command_joints(full_servo_action)
+            issued_at_unix = time.time()
+            issued_at_monotonic = time.monotonic()
+            self._last_servoj_waypoint = full_servo_action.copy()
+            self._last_left_gripper = float(gripper_action[0] / 100.0)
+            self._last_right_gripper = float(gripper_action[1] / 100.0)
+            self._recovery_blend_pending = False
+
+        self._notify_issued_action(
+            waypoint=full_servo_action,
+            left_gripper=float(gripper_action[0] / 100.0),
+            right_gripper=float(gripper_action[1] / 100.0),
+            trajectory_index=trajectory_index,
+            issued_at_unix=issued_at_unix,
+            issued_at_monotonic=issued_at_monotonic,
+            action_metadata=dict(action_metadata or {}),
+        )
 
     def execute_trajectory(self,
                            left_arm_trajectory,
@@ -692,15 +961,18 @@ class Tron2EnvOperator:
                            right_gripper_trajectory,
                            head_trajectory=None,
                            dt: float = 0.1,
-                           async_exec: bool = False):
+                           async_exec: bool = False,
+                           action_metadata=None):
         """Feed policy waypoints to the ``tron2_env`` ServoJ controller."""
         self._validate_positive('dt', dt)
-        self.stop_trajectory()
+        old_leftover = self._stop_trajectory_feeder(
+            capture_leftover=self.chunk_boundary_blend_enabled)
         self._traj_stop_event = threading.Event()
         self._trajectory_error = None
         args = (left_arm_trajectory, right_arm_trajectory,
                 left_gripper_trajectory, right_gripper_trajectory,
-                head_trajectory, float(dt), self._traj_stop_event)
+                head_trajectory, float(dt), self._traj_stop_event,
+                old_leftover, dict(action_metadata or {}))
 
         if async_exec:
             self._traj_thread = threading.Thread(
@@ -713,10 +985,19 @@ class Tron2EnvOperator:
             self._traj_thread = None
             self._run_servoj_trajectory(*args)
 
-    def _run_servoj_trajectory(self, left_arm_trajectory, right_arm_trajectory,
+    def _run_servoj_trajectory(self,
+                               left_arm_trajectory,
+                               right_arm_trajectory,
                                left_gripper_trajectory,
-                               right_gripper_trajectory, head_trajectory, dt,
-                               stop_event):
+                               right_gripper_trajectory,
+                               head_trajectory,
+                               dt,
+                               stop_event,
+                               old_leftover=None,
+                               action_metadata=None):
+        controller = None
+        issued_any = False
+        completed = False
         try:
             with self._control_lock:
                 controller = self._motion_controller
@@ -755,6 +1036,42 @@ class Tron2EnvOperator:
                         state,
                         check_state_source=(starting_controller)))
 
+                waypoints, left_gripper, right_gripper, boundary_blend_count = (
+                    self._apply_chunk_boundary_blend(waypoints, left_gripper,
+                                                     right_gripper,
+                                                     old_leftover))
+                recovery_count = 0
+                if boundary_blend_count:
+                    self._recovery_blend_pending = False
+                    logger.info(
+                        'ServoJ chunk boundary: smoothstep-blended %d/%d '
+                        'policy frames (scope=%s).', boundary_blend_count,
+                        self.chunk_boundary_blend_frames,
+                        self.chunk_boundary_blend_scope)
+                else:
+                    waypoints, left_gripper, right_gripper, recovery_count = (
+                        self._apply_recovery_blend(waypoints, left_gripper,
+                                                   right_gripper))
+                    if recovery_count:
+                        logger.warning(
+                            'ServoJ action stream recovered after holding the '
+                            'last target; blending the next %d/%d policy '
+                            'frames.', recovery_count,
+                            self.recovery_blend_frames)
+                if boundary_blend_count or recovery_count:
+                    # The transformed trajectory is checked again because the
+                    # blend changes the executable waypoint sequence.
+                    self._validate_servoj_waypoint_deltas(
+                        self._state_to_servoj(
+                            np.asarray(state, dtype=np.float64)), waypoints)
+                # Any pending transition has now been consumed. If this feeder
+                # drains, fails, or is later stopped, state is updated below.
+                self._recovery_blend_pending = False
+                self._active_servoj_waypoints = waypoints.copy()
+                self._active_left_gripper = left_gripper.copy()
+                self._active_right_gripper = right_gripper.copy()
+                self._active_next_index = 0
+
             start = time.perf_counter()
             for index, waypoint in enumerate(waypoints):
                 if stop_event.is_set():
@@ -769,17 +1086,39 @@ class Tron2EnvOperator:
                     float(right_gripper[index] * 100.0),
                 )
                 controller.command_joints(waypoint, eta=dt)
+                issued_at_unix = time.time()
+                issued_at_monotonic = time.monotonic()
+                with self._control_lock:
+                    self._last_servoj_waypoint = waypoint.copy()
+                    self._last_left_gripper = float(left_gripper[index])
+                    self._last_right_gripper = float(right_gripper[index])
+                    self._active_next_index = index + 1
+                self._notify_issued_action(
+                    waypoint=waypoint,
+                    left_gripper=left_gripper[index],
+                    right_gripper=right_gripper[index],
+                    trajectory_index=index,
+                    issued_at_unix=issued_at_unix,
+                    issued_at_monotonic=issued_at_monotonic,
+                    action_metadata=action_metadata,
+                )
+                issued_any = True
 
                 deadline = start + (index + 1) * dt
                 remaining = deadline - time.perf_counter()
                 if remaining > 0:
                     stop_event.wait(remaining)
+            completed = issued_any and not stop_event.is_set()
         except ValueError as exc:
             # A rejected trajectory is recoverable. If MotionController has
             # already started, issuing no replacement command keeps its last
             # accepted ServoJ target unchanged for the next inference cycle.
             self._trajectory_error = exc
             stop_event.set()
+            with self._control_lock:
+                self._recovery_blend_pending = (
+                    self._motion_controller is not None
+                    and self._last_servoj_waypoint is not None)
             raise
         except Exception as exc:
             self._trajectory_error = exc
@@ -787,17 +1126,35 @@ class Tron2EnvOperator:
             with self._control_lock:
                 self._disconnect_control_locked()
             raise
+        finally:
+            if completed:
+                with self._control_lock:
+                    # With no queued waypoint left, MotionController keeps
+                    # publishing this final target. The next valid trajectory
+                    # should recover gradually from that held command.
+                    if self._motion_controller is controller:
+                        self._recovery_blend_pending = True
 
-    def stop_trajectory(self):
-        """Stop policy waypoint feeding while holding the latest target."""
+    def _stop_trajectory_feeder(self, capture_leftover: bool = False):
         self._traj_stop_event.set()
         thread = self._traj_thread
+        was_active = thread is not None and thread.is_alive()
         if (thread is not None and thread.is_alive()
                 and thread is not threading.current_thread()):
             thread.join(timeout=max(2.0, self.state_timeout))
             if thread.is_alive():
                 raise RuntimeError('ServoJ trajectory feeder did not stop.')
         self._traj_thread = None
+        with self._control_lock:
+            leftover = (
+                self._snapshot_active_leftover_locked()
+                if capture_leftover and was_active else None)
+            self._clear_active_trajectory_locked()
+        return leftover
+
+    def stop_trajectory(self):
+        """Stop policy waypoint feeding while holding the latest target."""
+        self._stop_trajectory_feeder(capture_leftover=False)
 
     def wait_for_trajectory(self):
         """Wait until the accepted policy trajectory has finished feeding.
@@ -811,6 +1168,8 @@ class Tron2EnvOperator:
                 and thread is not threading.current_thread()):
             thread.join()
         self._traj_thread = None
+        with self._control_lock:
+            self._clear_active_trajectory_locked()
 
         error = self._trajectory_error
         self._trajectory_error = None

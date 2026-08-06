@@ -875,3 +875,535 @@ commands and results that were actually executed.
     resolved `tron2_16` with task IDs 1–11.
 - Safety boundary: no model was loaded onto the GPU, no inference or robot
   client was started, and no observation or control WebSocket was contacted.
+
+## 2026-08-06 13:57 CST — Relax the PI0.5 LoRA ServoJ transition guard
+
+- Purpose: prevent repeated holds observed at the first transition of newly
+  predicted chunks while retaining the adjacent-target safety guard.
+- Evidence: the running non-RTC deployment rejected joint-13 transition-zero
+  deltas between 0.212055 and 0.292077 rad against the previous 0.2-rad
+  threshold and held the last accepted ServoJ target.
+- Change: raised only the PI0.5 LoRA deployment's
+  `max_servoj_step_rad` from 0.2 to 0.5 rad. The RTC deployment inherits this
+  operator value. The operator default and other model configurations remain
+  unchanged at 0.2 rad; finite-value, joint-limit, gripper, head-lock and
+  300-Hz interpolation behavior remain enabled.
+- Runtime boundary: the already-running process retains the old value loaded
+  at construction time and must be stopped and restarted before 0.5 rad takes
+  effect.
+- Validation actually executed: both the standard PI0.5 LoRA config and its
+  single-process RTC derivative resolved the limit to 0.5 rad; YAPF and
+  `git diff --check` passed, and all 18 focused CI-smoke tests passed with five
+  existing third-party warnings.
+
+## 2026-08-06 14:45 CST — Fix inference-time RTC prefix to nine steps
+
+- Purpose: use a deterministic prefix length at the upper edge of the
+  checkpoint's train-time RTC range for the requested deployment test.
+- Change: set the single-process `Tron2RTCInferenceRunner` configuration to
+  `enabled=True`, `method='prefix'`, and `prefix_len=9`. The action horizon
+  remains 50, so each conditioned prediction locks nine actions from the
+  previous chunk and generates the remaining 41.
+- Scope: this does not change the trained weights or train-time distribution
+  (`max_delay=10`, exponential). It also does not change the separate standard
+  non-RTC runner.
+- Runtime boundary: no inference or robot-control process was running while
+  this configuration was changed; a new RTC process must be started for the
+  fixed prefix to take effect.
+- Validation actually executed: the resolved deployment reported
+  `Tron2RTCInferenceRunner`, local model mode, a 50-step horizon, asynchronous
+  execution, `prefix_len=9`, and the 0.5-rad ServoJ transition limit; YAPF and
+  `git diff --check` passed, and all 18 focused CI-smoke tests passed with five
+  existing third-party warnings.
+
+## 2026-08-06 21:45 CST — Synchronize the 18k task3 fold-clothes RTC checkpoint
+
+- Purpose: place the requested standalone fold-clothes RTC checkpoint in an
+  isolated local work directory without mixing it with the existing non-RTC
+  fold checkpoint or task1/task2 RTC checkpoint.
+- Transfer:
+  - after the requested target changed from 16k to 18k, used resumable
+    `rsync --partial --append-verify` over the authorized SSH connection to
+    copy only `step-018000-epoch-001-loss=0.0137.safetensors`;
+  - synchronized `config.json`, `config.yaml`, `dataset_statistics.json`,
+    `llm_backbone_config.json`, README and the adapter manifest, and populated
+    the checkpoint-local tokenizer from the matching local PI0.5 base assets;
+  - intentionally excluded the 16k checkpoint, `.pt` training states, the 18k
+    adapter-only weight, logs and metrics because they are not needed for the
+    selected merged-checkpoint inference path.
+- Deployment metadata:
+  - verified the source dataset prompt from
+    `lerobot_dataset_task3/meta/tasks.jsonl` is `fold clothes`;
+  - added a checkpoint-local sidecar advertising only the previously reserved
+    global task ID `12`, so switching to this single-task checkpoint cannot
+    reinterpret or advertise the multi-task IDs 1–11;
+  - recorded training RTC settings from the saved config: uniform sampling
+    over explicit delays `[0, 5, 10, 19]` with `max_delay=20`.
+- Validation actually executed:
+  - the local file size is 14,466,989,776 bytes and local/remote SHA-256 both
+    equal `5966e6f80cc7d30060bb45fb589871c6e41a1d35aaaf1531c5abfd02645cf2e0`;
+  - safetensors header validation opened the file successfully and found 812
+    tensors;
+  - JSON validation and deployment metadata resolution passed with
+    `action_layout=tron2_16` and only `task_descriptions={'12': 'fold clothes'}`;
+  - confirmed that no 16k checkpoint exists in the new local directory.
+- Safety boundary: no model was loaded onto the GPU, no inference process was
+  started, and no robot observation or control connection was opened.
+
+## 2026-08-06 22:17 CST — Add six-frame ServoJ stream-recovery blending
+
+- Purpose: avoid an abrupt jump when policy waypoint delivery resumes after a
+  trajectory has drained and `MotionController` has been holding its final
+  ServoJ target.
+- Implementation:
+  - added `recovery_blend_frames` to `Tron2EnvOperator`, with an explicit
+    deployment value of six frames for all tracked Tron2 configurations;
+  - record the last successfully commanded arm/head waypoint and gripper
+    values, detect natural trajectory drain, and linearly blend the next six
+    30 Hz policy frames from that held command to the recovered trajectory;
+  - normal asynchronous preemption does not mark the stream as drained, so
+    ordinary RTC chunk replacement is not unnecessarily blended;
+  - MoveJ/reset and control-WebSocket restart clear the stored hold state;
+    finite-value, gripper-range, head-lock, joint-limit and 0.5-rad PI0.5 LoRA
+    waypoint-delta checks remain in force, including a second delta check on
+    the blended trajectory.
+- Validation actually executed:
+  - Python bytecode compilation of the modified operator passed;
+  - hardware-free operator and CI-smoke tests passed: 34 tests with five
+    existing third-party warnings;
+  - new tests verify exact 1/6 through 6/6 arm and gripper blending after a
+    drained trajectory, verify that replacement of an active asynchronous
+    trajectory does not trigger recovery blending, and verify that MoveJ reset
+    clears the old recovery origin.
+- Safety/runtime boundary: no inference model was loaded, no Bridge or robot
+  WebSocket was contacted, and no robot command was sent. A running deployment
+  must be restarted, and any separate PCM checkout must receive the source and
+  configuration changes before this behavior can take effect there.
+
+## 2026-08-06 22:31 CST — Add active-chunk smoothstep boundary blending
+
+- Purpose: smooth normal asynchronous RTC chunk replacement separately from
+  the previously added queue-drain recovery path.
+- Implementation:
+  - added `chunk_boundary_blend_enabled`, `chunk_boundary_blend_frames`, and
+    `chunk_boundary_blend_scope` to `Tron2EnvOperator`;
+  - track the prepared executable trajectory and the next unissued index under
+    the control lock; when an active feeder is preempted, atomically copy its
+    remaining actions before starting the replacement feeder;
+  - smoothstep-blend corresponding old/new actions over at most six frames,
+    using `u^2 * (3 - 2u)` weights; a feeder stopped before issuing any action
+    is not allowed to contribute an unexecuted plan;
+  - enabled the feature for the PI0.5 LoRA configuration inherited by local
+    RTC deployment, with six frames and `arm` scope. Gripper commands remain
+    unfiltered and the locked head is unchanged;
+  - preserve the separate six-frame drained-stream recovery path, MoveJ state
+    reset, and post-blend ServoJ waypoint-delta validation.
+- Validation actually executed:
+  - YAPF and Python bytecode compilation passed;
+  - hardware-free operator and CI-smoke tests passed: 35 tests with five
+    existing third-party warnings;
+  - the new regression test verifies the exact smoothstep weights against the
+    old unissued trajectory and confirms that `arm` scope leaves grippers at
+    the new chunk values; the existing disabled-switch preemption test remains
+    passing.
+- Safety/runtime boundary: no model, Bridge connection, control WebSocket, or
+  robot command was used. The changed process must be restarted; an external
+  PCM checkout must be synchronized separately.
+## 2026-08-06 23:08 CST — Disable active-chunk boundary blending
+
+- Set `inference.operator.chunk_boundary_blend_enabled=False` in the PI0.5
+  TRON2 LoRA deployment config at operator request.
+- Kept the independent `recovery_blend_frames=6` behavior enabled for stream
+  recovery; no controller implementation or safety limit was changed.
+- Validated the resolved Python config and confirmed boundary blending is
+  disabled while recovery blending remains six frames.
+
+## 2026-08-06 23:14 CST — Synchronize SeetaCloud task1/task2 RTC checkpoint
+
+- Used a resumable transfer for
+  `step-022000-epoch-002-loss=0.0046.safetensors` from the authorized
+  SeetaCloud training host into the matching local work directory.
+- The gateway did not execute non-interactive rsync/SFTP requests, so the
+  transfer used an HTTP Range endpoint bound only to remote loopback through
+  an SSH tunnel; the temporary endpoint and tunnel were stopped afterward.
+- Validation actually executed: remote and local sizes both equal
+  14,466,989,776 bytes; SHA-256 on both ends equals
+  `8f683100bb38a0da8ad144b6b7ef7277835ebcdb21c6b18a56b769d9b630efbc`;
+  the safetensors header contains 812 tensors and its maximum data offset
+  lands exactly at EOF. The `.part` file was atomically renamed only after
+  these checks passed.
+- No model, inference, training, Bridge connection, or robot control process
+  was started.
+
+## 2026-08-06 23:28 CST — Add keyboard-toggled issued-action recording
+
+- Purpose: collect directly comparable RTC and non-RTC action streams without
+  recording unexecuted tails from asynchronously preempted chunks.
+- Implementation:
+  - added `l` as an idle/running toggle that opens and closes one JSONL
+    session under configurable `inference.action_record_dir` (default
+    `work_dirs/action_records`);
+  - attached the recorder after a validated 30 Hz policy waypoint is accepted
+    by the ServoJ controller, recording issue timestamps, task/prompt,
+    trajectory and frame indices, RTC state, effective prefix length, and the
+    16- or 18-dimensional action in training layout;
+  - kept 300 Hz interpolation samples and unissued preempted-chunk tails out of
+    the dataset, and moved JSON serialization/filesystem writes to a background
+    queue so the ServoJ feeder does not perform disk I/O;
+  - RTC and non-RTC runners share the same implementation; dry run records no
+    action rows because it sends no robot commands.
+- PCM synchronization:
+  - atomically synchronized the runner, WebSocket operator, and PI0.5 LoRA
+    config to `/home/guest/FluxVLA-Tron2` after matching incoming SHA-256
+    values;
+  - preserved the replaced PCM files under
+    `/home/guest/fluxvla-action-record-backup.Hp73DM`;
+  - no inference/client process was running during synchronization.
+- Validation actually executed:
+  - local Python compilation and `git diff --check` passed;
+  - 38 hardware-free runner/operator tests passed with five existing
+    third-party warnings;
+  - the PCM's selected minimal runtime
+    `/home/guest/.venvs/fluxvla-tron2/bin/python` passed a remote-client-only
+    config/import and JSONL write/read smoke test. System `python3` lacks
+    `mmengine`, while the launch script correctly selects the minimal venv.
+- Safety/runtime boundary: no model was loaded, no observation/control
+  WebSocket was contacted, and no robot action was sent.
+
+## 2026-08-06 23:59 CST — Align fixed-prefix RTC execution and remain length
+
+- Root cause: the RTC model used a fixed `prefix_len=9`, but the runner sliced
+  each returned chunk at the measured, fractional inference latency. The
+  resulting replacement index and remain length changed from inference to
+  inference and were not aligned with the prefix boundary used to condition
+  the model.
+- Implementation:
+  - added a runner-level asynchronous offset hook and used monotonic timestamps
+    for inference/action time alignment;
+  - enabled `fixed_prefix_execution=True` for local RTC deployment: an early
+    result waits until the fixed prefix boundary and an accepted 50-step chunk
+    always starts at index 9, leaving exactly 41 actions;
+  - added `fixed_prefix_late_tolerance_steps=1.0`; results that miss the fixed
+    boundary by more than one policy step are held while the old trajectory
+    continues, then the loop re-observes and re-infers instead of executing a
+    stale offset or exiting;
+  - action JSONL rows now include the actual execution offset and fixed-switch
+    lateness. A fixed zero-step prefix is explicitly warned as unable to cover
+    non-zero inference latency.
+- Validation actually executed:
+  - Python compilation and `git diff --check` passed;
+  - 42 hardware-free runner/operator tests passed with five existing
+    third-party warnings, including exact 50-to-41 remain length, early-result
+    boundary waiting, and late-result hold tests for prefix lengths zero and
+    two;
+  - atomically synchronized the base/RTC runners and the new local-RTC config
+    to `/home/guest/FluxVLA-Tron2`, verified all three SHA-256 values, and
+    passed the PCM minimal-runtime remote-client import smoke test;
+  - preserved the two replaced PCM runner files under
+    `/home/guest/fluxvla-fixed-rtc-backup.MXu7B5` (the local-RTC config did not
+    previously exist on the PCM).
+- Safety/runtime boundary: no model was loaded, no inference/client process
+  was started, no WebSocket was contacted, and no robot command was sent.
+
+## 2026-08-07 00:32 CST — Replace fixed-boundary RTC with TRON2 ActionQueue scheduling
+
+- Purpose: keep FluxVLA's train-time prefix-RTC inference path but remove all
+  inference-latency/P95 step estimation and align deployment with the public
+  TRON2 producer/consumer queue structure.
+- Upstream comparison:
+  - rechecked the public `tron2_openpi/examples/tron2/pi_client_rtc.py` and the
+    pinned `tron2_env` `ActionQueue` implementation;
+  - retained its `H - execution_horizon` producer trigger, persistent
+    policy-rate consumer, atomic leftover snapshot and queue replacement by
+    the consumer's actual index delta, six-frame underflow recovery, optional
+    boundary/EMA postprocessing, and continuous `MotionController` lifetime;
+  - intentionally removed the public client's `LatencyTracker`, measured
+    delay conversion, rolling P95 buffer, and dynamically supplied model
+    delay. The configured `rtc_config.prefix_len` is the only model prefix and
+    never controls or estimates the executable queue index.
+- Implementation:
+  - replaced the prior wait-until-fixed-boundary/resample runner with a local
+    FluxVLA producer and one persistent 30 Hz `ActionQueue` consumer;
+  - inference continues concurrently with old-queue execution; merge uses the
+    actual consumer-index advance observed during inference, with no wall-time
+    to action-step conversion;
+  - added the `Tron2EnvOperator.execute_waypoint()` path so queue replacement
+    does not restart the 300 Hz ServoJ `MotionController`;
+  - queue underflow holds the most recent accepted ServoJ target and applies
+    the existing six-frame recovery blend; rejected/non-finite/incomplete
+    chunks warn and leave the current queue/target unchanged;
+  - preserved the `b`/`s`/`r`/`l` state machine, MoveJ reset, head lock,
+    finite/range checks, 0.5-rad adjacent ServoJ target guard, and current
+    FluxVLA checkpoint/config/prompt loading;
+  - local RTC defaults are `H=50`, `execution_horizon=10`, fixed
+    `prefix_len=9`, and action boundary/EMA postprocessing disabled.
+- Validation actually executed:
+  - YAPF, Python bytecode compilation, and `git diff --check` passed;
+  - RTC runner/operator and CI-smoke tests passed: 44 tests with five existing
+    third-party warnings, including a no-estimator runtime assertion;
+  - the complete repository test selection reported 41 passed, 21 skipped and
+    two DreamZero KV-cache failures. Those failures reproduce independently in
+    unchanged `DreamZeroHead` code/tests (`_create_kv_cache` is absent and
+    cache-mode results remain identical) and are unrelated to TRON2 RTC.
+- Safety/runtime boundary: no checkpoint was loaded for inference, no Bridge
+  or robot-control WebSocket was opened, and no robot command was sent. The
+  robot-side checkout was not changed because this RTC mode is the local
+  single-process GPU deployment.
+
+## 2026-08-07 00:39 CST — Accept PI0.5 padded raw actions in RTC queue
+
+- Root cause: the new RTC integrity check incorrectly required normalized raw
+  and denormalized executable actions to have equal feature dimensions. PI0.5
+  intentionally returns 32-dimensional padded raw actions for the next RTC
+  prefix, while the deployment denormalizer emits the 16-dimensional TRON2
+  command. Every valid initial chunk was therefore held before the consumer
+  could start.
+- Fix: keep horizon/finite-value validation for both arrays but allow their
+  feature dimensions to differ; retain raw 32-D actions in the original queue
+  and processed 16-D actions in the executable queue. Invalid-initial-chunk
+  retries now also pause for the configured poll interval to avoid log spam.
+- Validation actually executed: YAPF, Python compilation and
+  `git diff --check` passed; RTC/operator regression tests passed, 45 tests
+  with five existing third-party warnings, including a 32-D raw/16-D command
+  regression test.
+- Hardware boundary: diagnosis used the operator-provided log only. No model
+  or robot connection was started by this fix, and the already running process
+  must be stopped and restarted to load it.
+
+## 2026-08-07 00:49 CST — Create exact-upstream TRON2 RTC execution branch
+
+- Version-control boundary:
+  - saved the complete previous `main` worktree, including untracked files, as
+    `stash@{0}` with message `pre-tron2env-exact-rtc-20260807-0045`;
+  - created and switched to `tron2env-rtc-execution`;
+  - applied the stash without dropping it, so the new branch has the required
+    WebSocket, keyboard/reset, checkpoint and recording foundation while the
+    original state remains recoverable from the retained stash.
+- Upstream baseline:
+  - pinned `tron2_env` commit
+    `5b7b145229416f3731f61657e6fa71c89c37bc9d` and `tron2_openpi` commit
+    `fb1ca651bc0de96aef6a4d2d1445e98cb9a84ac5`;
+  - ported the RTC producer's `H-s` trigger, `ceil(latency / policy_period)`
+    measured delay, ten-sample recent P95, `LatencyTracker`, atomic
+    `ActionQueue` snapshot/merge, optional postprocessor and warmup structure;
+  - ported the consumer's 30 Hz loop, large-jump diagnostic, empty-queue hold,
+    six-frame recovery blend and immediate shutdown-event semantics.
+- Native execution path:
+  - replaced the RTC waypoint path with the pinned `Tron2Env.step` action
+    extraction, gripper `[0, 100]` clipping, current-head passthrough and
+    no-argument `MotionController.command_joints()` call;
+  - removed per-policy-tick measured-state polling and custom trajectory guard
+    execution from this RTC path. The controller remains measured-state-seeded
+    once at startup and performs 300 Hz linear interpolation/publishing;
+  - preserved the existing FluxVLA model/checkpoint loader, task-ID keyboard
+    state machine, action recorder and idle-only MoveJ reset integration.
+- Checkpoint adaptation:
+  - kept the selected fold-clothes checkpoint
+    `step-018000-epoch-001-loss=0.0137.safetensors` and task ID 12;
+  - synchronized runtime model settings with its checkpoint-local config:
+    `n_action_steps=50`, raw/action dimensions 32/16,
+    `rtc_training_config.max_delay=20`, uniform distribution and explicit
+    delays `[0, 5, 10, 19]`; initial deployment delay is nine frames and local
+    model execution uses BF16 mixed precision instead of the inherited FP32.
+- Validation actually executed:
+  - YAPF, Python bytecode compilation and `git diff --check` passed;
+  - 47 hardware-free RTC runner/operator/CI tests passed with five existing
+    third-party warnings;
+  - regression coverage includes the upstream P95 calculation, raw 32-D versus
+    executable 16-D queues, actual-index ActionQueue merge, shutdown-event
+    consumer, six-frame recovery and native current-head/gripper behavior;
+  - the complete test selection still reaches only the same two unrelated,
+    independently reproduced DreamZero KV-cache failures documented above;
+    all selected TRON2 tests pass.
+- Safety/runtime boundary: no inference model was loaded, no Bridge/control
+  WebSocket was contacted and no robot command was sent during this change.
+  Native RTC execution intentionally omits the project-specific per-tick
+  ServoJ guards; real-hardware smoothness and safety remain unvalidated.
+
+## 2026-08-07 01:11 CST — Switch RTC branch to native Tron2Env and discrete checkpoint prefixes
+
+- Purpose: remove the remaining locally reproduced TRON2 observation/control
+  path from `tron2env-rtc-execution`, while retaining only the FluxVLA adapter
+  needed to run the fold-clothes 18k train-time-RTC checkpoint.
+- Upstream verification:
+  - freshly cloned `limxdynamics/tron2_env` at
+    `5b7b145229416f3731f61657e6fa71c89c37bc9d` and `tron2_openpi` at
+    `fb1ca651bc0de96aef6a4d2d1445e98cb9a84ac5`;
+  - `diff -qr` confirmed that the installed `tron2-env==0.1.0` package is
+    identical to the pinned `tron2_env/src/tron2_env` source.
+- Implementation:
+  - added `Tron2NativeEnvOperator`, a thin adapter that directly constructs
+    the public `Tron2Env` and delegates observation to `get_obs()`, each 16-D
+    policy command to `step()`, and idle `r` reset to environment
+    reconstruction so the upstream MoveJ bring-up runs again;
+  - selected the public deployment topology: Bridge WebSocket images, robot
+    WebSocket state, 30 Hz policy playback, and the upstream 300 Hz
+    `MotionController`; head initialization remains unset for this robot;
+  - retained the official RTC scheduling values `H=50`, `s=10`, initial
+    `d=6`, `ceil(latency / 1/30s)`, ten-sample P95, actual-consumer-index
+    `ActionQueue` replacement, six-frame stall recovery, and disabled action
+    postprocessing;
+  - adapted dynamic delay to the checkpoint's explicitly confirmed supported
+    prefixes `{0, 5, 9, 19}` by rounding upward. Queue replacement still uses
+    the actual consumer index. The model receives padded normalized raw
+    previous actions with shape `[1, 50, 32]`; only denormalized 16-D actions
+    reach `Tron2Env.step()`;
+  - added `d`, quantized `prefix`, measured delay, and merge-used index to the
+    producer diagnostics, and recorded supported prefixes in action-session
+    metadata.
+- Commands and validation actually executed:
+  - YAPF, Python bytecode compilation, resolved-MMEngine-config inspection,
+    and `git diff --check` passed;
+  - project TRON2/RTC tests plus the freshly cloned upstream `tron2_env` tests:
+    83 passed with five existing third-party warnings;
+  - complete repository suite: 77 passed, 26 skipped, and the same two
+    unrelated DreamZero KV-cache failures (`_create_kv_cache` absent and cache
+    reuse output unchanged) already present in the branch baseline;
+  - confirmed the selected checkpoint exists locally at 14,466,989,776 bytes.
+- Runtime boundary: no checkpoint inference was launched, no Bridge or robot
+  WebSocket was opened, and no control command was sent. Real-hardware
+  smoothness remains unvalidated and requires an operator-supervised run.
+
+## 2026-08-07 01:31 CST — Correct fold RTC prefixes and isolate action jitter
+
+- Corrected the fold checkpoint deployment prefixes from the previously used
+  `[0, 5, 9, 19]` to the checkpoint-local `[0, 5, 10, 19]`. Measured delays
+  of six through ten frames now condition the model with prefix ten; actual
+  queue replacement continues to use the consumer's observed index.
+- Updated the RTC config regression fixtures and quantization expectations.
+  `/home/limx/miniconda3/envs/fluxvla/bin/python -m pytest
+  test/test_ci_smoke.py -q` passed all 35 tests with five existing third-party
+  warnings; `git diff --check` also passed.
+- Offline analysis of the operator-recorded 88-action RTC session found stable
+  32.42 ms policy pacing but strong within-chunk oscillation after the first
+  plain chunk. RTC-phase arm step P95 was 0.1233 rad versus 0.0315 rad in the
+  initial plain segment, and the largest 0.1655 rad change occurred inside a
+  generated chunk rather than at a queue replacement boundary.
+- Read-only inspection of the training server confirmed that the fold dataset
+  is 30 Hz. Thirty evenly sampled episodes (45,438 transitions) had a 0.0444
+  rad arm-step P95, approximately 5% velocity-sign reversals, and strongly
+  positive adjacent-velocity correlation; the deployed RTC actions had
+  46%--70% reversals and negative adjacent-velocity correlation. This rules
+  out an intended high-frequency training trajectory or a 30 Hz mismatch.
+- The training server code confirms that this checkpoint sampled only the
+  configured discrete delays, so prefix nine was an unseen conditioning value.
+  A second code-level risk remains: training actions are 18-D and padded to
+  32-D while the loss supervises only the first 16 dimensions, but deployment
+  currently feeds all 32 raw predicted dimensions back as the next clean RTC
+  prefix. The unsupervised tail may therefore be out of distribution. This is
+  a diagnosis only; no masking behavior was changed in this entry.
+- Hardware boundary: all investigation after the supplied recording was
+  offline/read-only. No robot command was issued. The already running process
+  predates the prefix correction and must be restarted to load it.
+
+## 2026-08-07 01:38 CST — Restrict RTC prefix feedback to supervised actions
+
+- Read-only inspection of the exact training-server source and dataset showed
+  that each 18-D action is padded to 32-D before RTC conditioning, while the
+  PI0.5 loss truncates both prediction and target to `ori_action_dim=16`.
+  Thus dimensions 16--17 contain clean head data during training and 18--31
+  are zero padding, but none of dimensions 16--31 receives action loss. The
+  previous deployment fed all 32 model-predicted dimensions back as the next
+  clean prefix, including that unsupervised tail.
+- Added `rtc_config.prefix_action_dim=16`. `ActionQueue` still retains the
+  complete raw 32-D chunk for scheduling and diagnostics, but the next model
+  request receives only the supervised first 16 dimensions. PI0.5's existing
+  inference path then zero-pads that tensor back to its 32-D internal width.
+  Queue timing, measured-delay replacement, prefix length, postprocessing and
+  robot command layout are unchanged.
+- Added configuration and shape regression coverage, startup diagnostics and
+  action-session metadata for the feedback width. Updated the RTC deployment
+  documentation and corrected the checkpoint prefix set to
+  `[0, 5, 10, 19]`.
+- Validation actually executed: YAPF, Python bytecode compilation and
+  `git diff --check` passed; `python -m pytest test/test_ci_smoke.py -q`
+  passed all 35 tests, and the combined RTC/operator selection passed all 57
+  tests, with five existing third-party warnings. No model was loaded and no
+  robot/Bridge connection or command was made.
+
+## 2026-08-07 01:48 CST — Match RTC head conditioning and fix prefix at 19
+
+- Further inspection showed that training did not condition the complete
+  16--31 feature tail with zeros. Dataset actions are 18-D: dimensions 16--17
+  are head targets and only dimensions 18--31 are padding. A deterministic
+  sample of 45,468 training frames found head 0 primarily at 0 or 1.0467 rad
+  (min-max normalized near -1 or +1), while head 1 primarily used -0.014,
+  0, or 0.0046 rad (normalized near -1, 0.505, or +1). Therefore zeroing both
+  head dimensions at deployment did not match train-time RTC conditioning.
+- The RTC runner now retains the latest measured two-joint head observation.
+  Prefix construction uses the previous raw model chunk's supervised first
+  16 dimensions, appends that measured locked head normalized with the exact
+  checkpoint action min/max statistics, and relies on PI0.5 to zero-pad the
+  remaining 14 features to its internal 32-D width. It fails explicitly if
+  the head, normalization type, or statistics are unavailable, and logs the
+  first raw/normalized head pair for operator verification.
+- The selected deployment also sets `include_head_in_state=True`. Its model
+  input now preserves the training dataset's full 18-D measured proprio
+  `[left7, left_gripper, right7, right_gripper, head2]`, while action parsing
+  and robot commands remain the established 16-D head-free layout. This fixes
+  a second zero-padded-head mismatch without authorizing head control.
+- Added `rtc_config.prefix_len=19` as a fixed trained model condition and
+  validates it against the checkpoint's `[0, 5, 10, 19]` set. This does not
+  alter ActionQueue timing: queue replacement still crops by actual consumer
+  progress during inference.
+- Updated configuration, action-record metadata and deployment documentation.
+  YAPF, bytecode compilation and `git diff --check` passed; the combined
+  RTC/config/operator selection passed all 59 tests with five existing
+  third-party warnings. No model, Bridge, robot state or command connection
+  was used during validation.
+
+## 2026-08-07 01:51 CST — Stage fold RTC 32k checkpoint
+
+- Pulled `step-032000-epoch-001-loss=0.0112.safetensors` from the authorized
+  LIMX training server into the existing fold RTC work directory without
+  replacing the 18k checkpoint. Transfer took 18 minutes 51 seconds at an
+  average 12.20 MB/s.
+- Verified the 14,466,989,776-byte file against the remote SHA-256
+  `36380569f7ab6930bbf066f9c3f95ac55460bbad00111acb86e73a3d7953b48b`.
+  Safetensors header inspection found 812 readable tensors.
+- Synchronized and hash-checked the remote `config.json`, `config.yaml`,
+  `dataset_statistics.json`, `adapter_config.json`, `README.md`, and
+  `llm_backbone_config.json`. The remote work directory did not contain
+  `deployment_metadata.json` or `tokenizer/`, so the already validated local
+  copies were preserved. No model or robot process was started.
+
+## 2026-08-07 07:17 CST — Reconstruct task1/task2 RTC 22k deployment files
+
+- Completed the partially downloaded
+  `pi05_task1_task2_rtc_lora_rank256_8gpu_bs8_40k_20260806_173542` work
+  directory after its original SeetaCloud endpoint became unavailable. Per
+  the training-run provenance supplied by the user, model structure,
+  tokenizer and task metadata were copied from the matching task1/task2
+  `...20260806_005318` run, while both model RTC configuration blocks were
+  set to the fold-RTC training settings: uniform delays, `max_delay=20`, and
+  `delay_values=[0, 5, 10, 19]`.
+- Preserved the 22k checkpoint and its existing statistics. Its statistics
+  SHA-256 matches the task1/task2 source run exactly. Deployment metadata
+  advertises task IDs 1--11 with `action_layout=tron2_16`; it does not
+  incorrectly advertise the fold-only task 12.
+- Offline validation loaded the local tokenizer as `GemmaTokenizerFast`
+  (257,153 tokens), verified JSON and YAML RTC blocks against the fold 32k
+  files, and verified every non-RTC config field against the task1/task2
+  source. Safetensors header inspection found 812 tensors in the
+  14,466,989,776-byte checkpoint. No model inference, Bridge connection or
+  robot command was started.
+
+## 2026-08-07 07:32 CST — Stage fold RTC 40k and audit SeetaCloud latest checkpoint
+
+- Pulled the fold RTC `step-040000-epoch-002-loss=0.0108.safetensors`
+  checkpoint from the authorized LIMX server. The 14,466,989,776-byte local
+  file matches the remote SHA-256
+  `047a2dab06009dd4b56a6e7123be5e3cf28a68637ad3758653406341d6843b9e`;
+  safetensors header, offsets and all 812 tensors are readable. Transfer took
+  18 minutes 27 seconds at an average 12.46 MB/s. The existing fold 18k and
+  32k checkpoints were preserved.
+- Synchronized and hash-checked the six configuration files present beside
+  that fold run. The remote run had no deployment metadata or tokenizer, so
+  the validated local copies were preserved.
+- Attempted the separately requested latest-checkpoint audit on the authorized
+  SeetaCloud endpoint. SSH login succeeds, but `/dev/shm/fluxvla-runs` and the
+  requested task1/task2 run no longer exist; `/dev/shm` is nearly empty and
+  has a fresh 07:26 mtime, consistent with tmpfs being cleared after an
+  instance restart. No newer checkpoint candidate could be listed or
+  transferred. The existing local 22k checkpoint and reconstructed config
+  were not modified. No training, inference or robot process was started.

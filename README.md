@@ -559,7 +559,8 @@ Press b to start, or type another task ID and press Enter.
 
 There is no repeat-count prompt. The keyboard state machine runs on the Power
 Computing Module; the GPU server only handles prediction requests. In dry-run
-mode, pressing `r` while idle prints and skips the prepare-pose command.
+mode, pressing `r` while idle prints and skips the prepare-pose command. Press
+`l` while idle or running to toggle issued-action recording.
 
 Expected dry-run output includes a printed action:
 
@@ -601,13 +602,43 @@ has not yet been accepted; an already accepted chunk is allowed to finish, and
 no subsequent prediction is sent to the controller. A new run requires a new
 task-ID selection followed by `b`.
 
+For a train-time RTC checkpoint, use the single-process
+`configs/pi05/pi05_paligemma_tron2_lora_rtc_local_inference.py` config on the
+GPU computer. It keeps FluxVLA model loading unchanged; only the public
+client's policy request is adapted to the selected checkpoint. RTC scheduling
+follows the pinned public client: `rtc_config.delay=6` seeds the first request,
+then `ceil(inference_latency / policy_period)` and the recent ten-sample P95
+produce dynamic delay. The fold-clothes checkpoint supports only prefixes
+`{0, 5, 10, 19}`, so the model adapter rounds delay upward to the first
+supported prefix. Training supervises only the 16 deployed action dimensions;
+`rtc_config.prefix_len=19` fixes the model condition at a trained value.
+`rtc_config.prefix_action_dim=16` feeds back those dimensions, appends the
+measured head using the checkpoint's action normalization, and lets PI0.5
+zero-pad the remaining tail to 32-D. The model state also keeps the measured
+18-D proprio used by training, while robot commands remain 16-D. `ActionQueue` still resolves
+replacement with the actual consumer index. The persistent 30 Hz consumer calls the real pinned
+`Tron2Env.step()` implementation while Bridge images, robot-WebSocket state,
+gripper commands, 300 Hz interpolation, and ServoJ publication remain owned by
+the upstream runtime.
+
+### Issued-action recording
+
+RTC and non-RTC runners both use `l` to start or stop a JSONL session under
+`work_dirs/action_records/`. Each row records one validated 30 Hz policy
+waypoint actually issued to ServoJ, with timestamps, task/instruction,
+trajectory/frame indices, RTC state, effective prefix length, and the action
+vector. Preempted old-chunk tails and 300 Hz interpolation samples are not
+recorded. Writing runs on a background thread. Remote non-RTC files live on
+the robot client; single-process RTC files live on the GPU computer. Dry run
+has no action rows because it sends no commands.
+
 ## 11. Move to the Prepare Pose
 
 While the client is idle, press `r` to run the same configured prepare-pose
 sequence previously exposed as task ID `0`:
 
 ```text
-[TRON2 client idle] Type task ID and press Enter. b=start, r=prepare pose.
+[TRON2 client idle] Type task ID and press Enter. b=start, r=prepare pose, l=toggle action recording.
 ```
 
 `r` is ignored while a task is running; press `s`, wait until the client
@@ -719,6 +750,7 @@ The most important runtime switches are:
 | ----------------------------- | ---------------------------------------- |
 | `inference.dry_run=True`      | full inference flow, no robot action     |
 | `inference.dry_run=False`     | execute returned actions on the robot    |
+| `inference.action_record_dir` | JSONL directory toggled by the `l` key   |
 | `inference.operator.ws_port`  | Tron2 WebSocket controller port          |
 | `inference.operator.servoj_publish_rate` | ServoJ background rate (300 Hz) |
 | `inference.operator.max_servoj_step_rad` | Per-waypoint delta guard (rad) |

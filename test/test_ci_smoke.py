@@ -22,6 +22,7 @@ import termios
 import threading
 import time
 from pathlib import Path
+from types import SimpleNamespace
 
 import numpy as np
 import pytest
@@ -29,9 +30,9 @@ from mmengine import Config
 
 from fluxvla.engines.runners.serving.serve import load_deployment_metadata
 from fluxvla.engines.runners.tron2_inference_runner import (
-    Tron2InferenceRunner, _TerminalKeyReader)
-from fluxvla.engines.runners.tron2_rtc_inference_runner import \
-    Tron2RTCInferenceRunner
+    Tron2InferenceRunner, _ActionJSONLRecorder, _TerminalKeyReader)
+from fluxvla.engines.runners.tron2_rtc_inference_runner import (
+    Tron2RTCInferenceRunner, _RTCActionPostProcessor)
 
 ROOT = Path(__file__).resolve().parents[1]
 
@@ -54,6 +55,7 @@ def test_tron2_lora_config_deployment_defaults():
     assert inference['remote_inference']['server_port'] == 5555
     assert inference['type'] == 'Tron2InferenceRunner'
     assert inference['action_chunk'] == 32
+    assert inference['action_record_dir'] == 'work_dirs/action_records'
     assert 'rtc_config' not in inference
     assert 'execute_horizon' not in inference
     assert operator['type'] == 'Tron2EnvOperator'
@@ -72,7 +74,11 @@ def test_tron2_lora_config_deployment_defaults():
     assert operator['ws_accid'] is None
     assert operator['movej_duration'] == 2.0
     assert operator['servoj_publish_rate'] == 300.0
-    assert operator['max_servoj_step_rad'] == 0.2
+    assert operator['recovery_blend_frames'] == 6
+    assert operator['chunk_boundary_blend_enabled'] is False
+    assert operator['chunk_boundary_blend_frames'] == 6
+    assert operator['chunk_boundary_blend_scope'] == 'arm'
+    assert operator['max_servoj_step_rad'] == 0.5
     assert operator['max_state_source_mismatch_rad'] is None
     assert operator['lock_head'] is True
     assert operator['max_head_hold_error_rad'] == 0.05
@@ -86,17 +92,50 @@ def test_tron2_rtc_local_inference_config():
     assert inference.type == 'Tron2RTCInferenceRunner'
     assert inference.remote_inference is None
     assert inference.action_chunk == 50
-    assert inference.async_execution is True
+    assert inference.async_execution is False
     assert inference.execute_horizon is None
+    assert inference.mixed_precision_dtype == 'bf16'
+    assert inference.enable_mixed_precision is True
+    assert inference.include_head_in_state is True
     assert inference.rtc_config == {
         'enabled': True,
         'method': 'prefix',
-        'prefix_len': None,
+        'delay': 6,
+        'execution_horizon': 10,
+        'trigger_poll_interval_s': 0.005,
+        'observation_timeout_budget_s': 5.0,
+        'recovery_blend_frames': 6,
+        'prefix_len': 19,
+        'prefix_action_dim': 16,
+        'prefix_head_from_observation': True,
+        'action_postprocess': {
+            'enabled': False,
+            'boundary_blend_frames': 0,
+            'boundary_blend_curve': 'smoothstep',
+            'boundary_blend_scope': 'arm',
+            'ema_alpha': 1.0,
+            'ema_frames': 0,
+            'ema_scope': 'arm',
+        },
     }
     assert inference.publish_rate == 30
     assert inference.dry_run is False
-    assert cfg.model.rtc_training_config.max_delay == 10
-    assert cfg.inference_model.rtc_training_config.max_delay == 10
+    assert inference.action_record_dir == 'work_dirs/action_records'
+    assert inference.operator.type == 'Tron2NativeEnvOperator'
+    assert inference.operator.bridge_state_source == 'legacy'
+    assert inference.operator.state_dim == 18
+    assert inference.operator.fps == 30.0
+    assert inference.operator.publish_rate == 300.0
+    assert inference.operator.init_head is None
+    expected_training_rtc = {
+        'enabled': True,
+        'max_delay': 20,
+        'distribution': 'uniform',
+        'delay_values': [0, 5, 10, 19],
+        'temperature': 1.0,
+    }
+    assert cfg.model.rtc_training_config == expected_training_rtc
+    assert cfg.inference_model.rtc_training_config == expected_training_rtc
     assert inference.task_descriptions == {
         '1':
         'Put the flowers in the vase',
@@ -126,6 +165,191 @@ def test_tron2_rtc_local_inference_config():
     assert issubclass(Tron2RTCInferenceRunner, Tron2InferenceRunner)
 
 
+def test_tron2_rtc_dynamic_delay_conditions_model_inputs():
+    runner = Tron2RTCInferenceRunner.__new__(Tron2RTCInferenceRunner)
+    runner.action_chunk = 50
+    runner.vla = SimpleNamespace(rtc_training_config={
+        'max_delay': 20,
+        'delay_values': [0, 5, 10, 19],
+    })
+    runner._warned_delay_outside_training_range = False
+    runner.fixed_model_prefix = None
+    runner.prefix_action_dim = 16
+    runner.prefix_head_from_observation = False
+    previous = np.arange(40 * 32, dtype=np.float32).reshape(40, 32)
+
+    padded, prefix_len = runner._prepare_rtc_inputs(previous, 6)
+
+    assert prefix_len == 10
+    assert padded.shape == (50, 16)
+    np.testing.assert_array_equal(padded[:40], previous[:, :16])
+    np.testing.assert_array_equal(padded[40:], np.zeros((10, 16)))
+
+
+@pytest.mark.parametrize(('delay', 'expected_prefix'), [
+    (0, 0),
+    (1, 5),
+    (5, 5),
+    (6, 10),
+    (9, 10),
+    (10, 10),
+    (19, 19),
+    (20, 19),
+])
+def test_tron2_rtc_quantizes_delay_to_checkpoint_prefixes(
+        delay, expected_prefix):
+    runner = Tron2RTCInferenceRunner.__new__(Tron2RTCInferenceRunner)
+    runner.action_chunk = 50
+    runner.vla = SimpleNamespace(rtc_training_config={
+        'max_delay': 20,
+        'delay_values': [0, 5, 10, 19],
+    })
+    runner._warned_delay_outside_training_range = False
+    runner.fixed_model_prefix = None
+    runner.prefix_action_dim = 16
+    runner.prefix_head_from_observation = False
+
+    _, prefix_len = runner._prepare_rtc_inputs(
+        np.zeros((40, 32), dtype=np.float32), delay)
+
+    assert prefix_len == expected_prefix
+
+
+def test_tron2_rtc_fixed_prefix_uses_measured_normalized_head():
+    runner = Tron2RTCInferenceRunner.__new__(Tron2RTCInferenceRunner)
+    runner.action_chunk = 50
+    runner.vla = SimpleNamespace(rtc_training_config={
+        'max_delay': 20,
+        'delay_values': [0, 5, 10, 19],
+    })
+    runner._warned_delay_outside_training_range = False
+    runner.fixed_model_prefix = 19
+    runner.prefix_action_dim = 16
+    runner.prefix_head_from_observation = True
+    runner._latest_head_position = np.array([0.5, 1.5], dtype=np.float32)
+    runner._reported_prefix_head = False
+    runner.task_suite_name = 'private'
+    minimum = np.zeros(18, dtype=np.float32)
+    maximum = np.full(18, 2.0, dtype=np.float32)
+    runner.denormalize_action = SimpleNamespace(
+        norm_type='min_max',
+        norm_stats={
+            'private': {
+                'action': {
+                    'min': minimum.tolist(),
+                    'max': maximum.tolist(),
+                }
+            }
+        },
+    )
+    previous = np.arange(40 * 32, dtype=np.float32).reshape(40, 32)
+
+    padded, prefix_len = runner._prepare_rtc_inputs(previous, 6)
+
+    assert prefix_len == 19
+    assert padded.shape == (50, 18)
+    np.testing.assert_array_equal(padded[:40, :16], previous[:, :16])
+    expected_head = np.tile([-0.5, 0.5], (40, 1))
+    np.testing.assert_allclose(padded[:40, 16:18], expected_head, atol=1e-6)
+    np.testing.assert_array_equal(padded[40:], np.zeros((10, 18)))
+
+
+def test_tron2_rtc_runtime_uses_upstream_action_queue_and_latency_tracker():
+    from tron2_env.rtc import ActionQueue, LatencyTracker
+
+    assert Tron2RTCInferenceRunner._rtc_runtime_types() == (ActionQueue,
+                                                            LatencyTracker)
+
+
+def test_tron2_rtc_recent_delay_p95_matches_public_client():
+    assert Tron2RTCInferenceRunner._p95_int([]) == 0
+    assert Tron2RTCInferenceRunner._p95_int([2]) == 2
+    assert Tron2RTCInferenceRunner._p95_int([1, 2, 3, 4, 5, 6, 7, 8, 9,
+                                             10]) == 10
+
+
+def test_tron2_rtc_accepts_padded_raw_and_tron2_command_dimensions():
+    runner = Tron2RTCInferenceRunner.__new__(Tron2RTCInferenceRunner)
+    runner.action_chunk = 50
+    runner._action_ctx = SimpleNamespace(
+        raw_actions=np.zeros((50, 32), dtype=np.float32))
+    processed = np.zeros((50, 16), dtype=np.float32)
+
+    assert runner._validate_action_chunks(processed) is processed
+
+
+def test_tron2_rtc_action_queue_merge_uses_actual_consumed_index():
+    from tron2_env.rtc import ActionQueue
+
+    action_queue = ActionQueue(rtc_enabled=True)
+    old = np.arange(50, dtype=np.float32)[:, None]
+    action_queue.merge(old, old, real_delay=0)
+    action_index_before, _, _ = action_queue.snapshot_left_over()
+    for _ in range(7):
+        action_queue.get()
+
+    new = np.arange(1000, 1050, dtype=np.float32)[:, None]
+    used_delay = action_queue.merge(
+        new,
+        new,
+        real_delay=0,
+        action_index_before_inference=action_index_before,
+    )
+
+    assert used_delay == 7
+    np.testing.assert_array_equal(action_queue.get(), [1007.0])
+
+
+def test_tron2_rtc_consumer_uses_upstream_shutdown_event():
+    from tron2_env.rtc import ActionQueue
+
+    runner = Tron2RTCInferenceRunner.__new__(Tron2RTCInferenceRunner)
+    runner.dt = 0.001
+    runner.recovery_blend_frames = 6
+    issued = []
+    shutdown_event = threading.Event()
+
+    def execute(action, source_index, queue_size):
+        issued.append((action.copy(), source_index, queue_size))
+        if len(issued) == 3:
+            shutdown_event.set()
+
+    runner._execute_rtc_waypoint = execute
+    action_queue = ActionQueue(rtc_enabled=True)
+    actions = np.arange(3 * 16, dtype=np.float32).reshape(3, 16)
+    action_queue.merge(actions, actions, real_delay=0)
+    errors = []
+
+    runner._consume_actions(action_queue, shutdown_event, errors)
+
+    assert not errors
+    assert [item[1] for item in issued] == [0, 1, 2]
+    assert [item[2] for item in issued] == [2, 1, 0]
+    np.testing.assert_array_equal(
+        np.stack([item[0] for item in issued]), actions)
+
+
+def test_tron2_rtc_optional_smoothstep_matches_public_client_boundary():
+    processor = _RTCActionPostProcessor({
+        'enabled': True,
+        'boundary_blend_frames': 2,
+        'boundary_blend_curve': 'smoothstep',
+        'boundary_blend_scope': 'arm',
+        'ema_alpha': 1.0,
+    })
+    old = np.zeros((2, 16), dtype=np.float64)
+    new = np.ones((4, 16), dtype=np.float64)
+
+    processed = processor.apply(new, old, merge_delay=1)
+
+    first_alpha = (1.0 / 3.0)**2 * (3.0 - 2.0 / 3.0)
+    second_alpha = (2.0 / 3.0)**2 * (3.0 - 4.0 / 3.0)
+    arm_indices = list(range(7)) + list(range(8, 15))
+    np.testing.assert_allclose(processed[1, arm_indices], first_alpha)
+    np.testing.assert_allclose(processed[2, arm_indices], second_alpha)
+    np.testing.assert_allclose(processed[:, [7, 15]], 1.0)
+
+
 def test_all_tron2_configs_use_tron2_env_operator():
     config_paths = [
         ROOT / 'configs' / 'pi05' / 'pi05_paligemma_tron2_full_finetune.py',
@@ -141,7 +365,12 @@ def test_all_tron2_configs_use_tron2_env_operator():
         assert 'img_top_topic' not in operator
         assert 'joint_state_topic' not in operator
         assert operator['servoj_publish_rate'] == 300.0
-        assert operator['max_servoj_step_rad'] == 0.2
+        assert operator['recovery_blend_frames'] == 6
+        assert operator.get('chunk_boundary_blend_enabled', False) is False
+        expected_step_limit = (0.5 if config_path.name
+                               == 'pi05_paligemma_tron2_lora_finetune.py' else
+                               0.2)
+        assert operator['max_servoj_step_rad'] == expected_step_limit
         assert operator['max_state_source_mismatch_rad'] is None
         assert operator['lock_head'] is True
 
@@ -269,6 +498,69 @@ class _FakeKeyReader:
             return None
 
 
+def test_tron2_action_jsonl_recorder_writes_complete_session(tmp_path):
+    recorder = _ActionJSONLRecorder(tmp_path)
+    path = recorder.start({
+        'inference_mode': 'rtc',
+        'action_layout': 'tron2_16',
+    })
+    assert recorder.record({
+        'record_type': 'action',
+        'trajectory_id': 3,
+        'action': list(range(16)),
+    })
+
+    stopped_path, count, error = recorder.stop()
+
+    assert stopped_path == path
+    assert count == 1
+    assert error is None
+    records = [
+        json.loads(line)
+        for line in path.read_text(encoding='utf-8').splitlines()
+    ]
+    assert [record['record_type'] for record in records
+            ] == ['session_start', 'action', 'session_end']
+    assert records[1]['sequence_index'] == 0
+    assert records[1]['action'] == list(range(16))
+    assert records[2]['action_count'] == 1
+
+
+def test_tron2_runner_records_issued_action_in_training_layout(tmp_path):
+    runner = Tron2InferenceRunner.__new__(Tron2InferenceRunner)
+    runner.action_layout = 'tron2_16'
+    runner._action_recorder = _ActionJSONLRecorder(tmp_path)
+    path = runner._action_recorder.start({
+        'inference_mode': 'non_rtc',
+        'action_layout': 'tron2_16',
+    })
+
+    runner._record_issued_action(
+        waypoint=np.arange(16, dtype=np.float64),
+        left_gripper=0.25,
+        right_gripper=0.75,
+        trajectory_index=4,
+        issued_at_unix=10.0,
+        issued_at_monotonic=5.0,
+        action_metadata={
+            'trajectory_id': 2,
+            'task_id': '1'
+        },
+    )
+    runner._action_recorder.stop()
+
+    records = [
+        json.loads(line)
+        for line in path.read_text(encoding='utf-8').splitlines()
+    ]
+    action_record = records[1]
+    assert action_record['task_id'] == '1'
+    assert action_record['trajectory_id'] == 2
+    assert action_record['trajectory_frame_index'] == 4
+    assert action_record['action'] == (
+        list(range(7)) + [0.25] + list(range(7, 14)) + [0.75])
+
+
 def test_tron2_terminal_key_reader_reads_one_key_and_restores_tty():
     master_fd, slave_fd = pty.openpty()
     saved_attributes = termios.tcgetattr(slave_fd)
@@ -314,11 +606,14 @@ def test_tron2_idle_keyboard_requires_confirmed_task_before_start():
         '1': 'put flowers in vase',
         '6': 'fold clothes',
     }
+    toggles = []
+    runner._toggle_action_recording = lambda: toggles.append('toggle')
 
     command = runner._wait_for_idle_command(
-        _FakeKeyReader(['b', '6', '\n', 'b']))
+        _FakeKeyReader(['l', 'b', '6', '\n', 'b']))
 
     assert command == ('start', '6')
+    assert toggles == ['toggle']
 
 
 def test_tron2_idle_keyboard_r_requests_prepare_pose():
@@ -335,10 +630,12 @@ def test_tron2_active_keyboard_stops_and_ignores_prepare():
     stop_requested = threading.Event()
     monitor_done = threading.Event()
     monitor_errors = []
+    toggles = []
+    runner._toggle_action_recording = lambda: toggles.append('toggle')
     monitor_thread = threading.Thread(
         target=runner._monitor_active_keys,
         args=(
-            _FakeKeyReader(['r', 'b', 's']),
+            _FakeKeyReader(['r', 'b', 'l', 's']),
             stop_requested,
             monitor_done,
             monitor_errors,
@@ -352,6 +649,7 @@ def test_tron2_active_keyboard_stops_and_ignores_prepare():
 
     assert not monitor_thread.is_alive()
     assert not monitor_errors
+    assert toggles == ['toggle']
 
 
 def test_tron2_async_task_drains_before_idle_reset_is_enabled():
