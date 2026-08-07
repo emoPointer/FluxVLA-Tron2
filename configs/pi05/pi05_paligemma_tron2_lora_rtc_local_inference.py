@@ -109,6 +109,8 @@ inference = dict(
         init_head=None,
         init_ee_z_min=-0.6,
         init_gripper_opening=1.0,
+        # Idle r: open both grippers and allow them to settle before MoveJ.
+        reset_gripper_open_wait_s=0.5,
     ),
     # Stable global IDs: flower first, task2 prompts in dataset task_index
     # order, and the separately trained fold-clothes task last.

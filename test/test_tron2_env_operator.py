@@ -99,16 +99,31 @@ class FakeNativeConfig:
         self.__dict__.update(kwargs)
 
 
+class FakeNativeRobot:
+
+    def __init__(self, events):
+        self.events = events
+        self.gripper_calls = []
+
+    def set_gripper(self, left_opening, right_opening):
+        call = (float(left_opening), float(right_opening))
+        self.gripper_calls.append(call)
+        self.events.append(('gripper', call))
+
+
 class FakeNativeEnv:
 
     instances = []
+    events = []
 
     def __init__(self, config):
         self.config = config
         self.closed = False
         self.steps = []
         self.last_action = None
+        self.robot = FakeNativeRobot(type(self).events)
         type(self).instances.append(self)
+        type(self).events.append(('create', self))
 
     def get_obs(self):
         return make_bridge_observation()
@@ -125,6 +140,7 @@ class FakeNativeEnv:
 
     def close(self):
         self.closed = True
+        type(self).events.append(('close', self))
 
 
 def make_operator(transports):
@@ -189,6 +205,7 @@ def make_bridge_observation():
 
 def make_native_operator(monkeypatch):
     FakeNativeEnv.instances = []
+    FakeNativeEnv.events = []
     runtime_types = (FakeNativeConfig, FakeNativeConfig, FakeNativeConfig,
                      FakeNativeConfig, FakeNativeEnv)
     monkeypatch.setattr(
@@ -205,6 +222,7 @@ def make_native_operator(monkeypatch):
         publish_rate=300.0,
         init_joints=np.zeros(14),
         init_head=None,
+        reset_gripper_open_wait_s=0.0,
     )
 
 
@@ -244,6 +262,71 @@ def test_native_operator_delegates_observation_and_step(monkeypatch):
     np.testing.assert_allclose(issued[0]['waypoint'][-2:], [0.4, -0.3])
 
 
+def test_native_operator_executes_non_rtc_trajectory_at_policy_rate(
+        monkeypatch):
+    operator = make_native_operator(monkeypatch)
+    env = FakeNativeEnv.instances[-1]
+    issued = []
+    operator.set_issued_action_callback(lambda **record: issued.append(record))
+    clock = {'now': 10.0}
+    sleeps = []
+
+    monkeypatch.setattr(time, 'perf_counter', lambda: clock['now'])
+
+    def advance_clock(delay):
+        sleeps.append(delay)
+        clock['now'] += delay
+
+    monkeypatch.setattr(time, 'sleep', advance_clock)
+    left = np.arange(21, dtype=np.float64).reshape(3, 7) / 100.0
+    right = -left
+
+    operator.execute_trajectory(
+        left_arm_trajectory=left,
+        right_arm_trajectory=right,
+        left_gripper_trajectory=[0.1, 0.2, 0.3],
+        right_gripper_trajectory=[0.9, 0.8, 0.7],
+        dt=1.0 / 30.0,
+        action_metadata={
+            'trajectory_id': 8,
+            'rtc_enabled': False,
+        },
+    )
+
+    assert len(env.steps) == 3
+    np.testing.assert_allclose(env.steps[0][:7], left[0])
+    np.testing.assert_allclose(env.steps[-1][8:15], right[-1])
+    assert all(len(action) == 16 for action in env.steps)
+    assert [record['trajectory_index'] for record in issued] == [0, 1, 2]
+    assert all(record['action_metadata']['rtc_enabled'] is False
+               for record in issued)
+    assert sleeps == pytest.approx([1.0 / 30.0] * 3)
+
+
+def test_native_operator_rejects_invalid_trajectory_before_execution(
+        monkeypatch):
+    operator = make_native_operator(monkeypatch)
+    env = FakeNativeEnv.instances[-1]
+
+    with pytest.raises(ValueError, match='same number of frames'):
+        operator.execute_trajectory(
+            left_arm_trajectory=np.zeros((2, 7)),
+            right_arm_trajectory=np.zeros((1, 7)),
+            left_gripper_trajectory=np.zeros(2),
+            right_gripper_trajectory=np.zeros(2),
+        )
+    with pytest.raises(ValueError, match='synchronous'):
+        operator.execute_trajectory(
+            left_arm_trajectory=np.zeros((1, 7)),
+            right_arm_trajectory=np.zeros((1, 7)),
+            left_gripper_trajectory=np.zeros(1),
+            right_gripper_trajectory=np.zeros(1),
+            async_exec=True,
+        )
+
+    assert env.steps == []
+
+
 def test_native_reset_reconstructs_upstream_environment(monkeypatch):
     operator = make_native_operator(monkeypatch)
     first = FakeNativeEnv.instances[-1]
@@ -254,6 +337,45 @@ def test_native_reset_reconstructs_upstream_environment(monkeypatch):
     assert first.closed is True
     assert second is not first
     assert operator.native_env is second
+    assert first.robot.gripper_calls == [(100.0, 100.0)]
+    assert FakeNativeEnv.events == [
+        ('create', first),
+        ('gripper', (100.0, 100.0)),
+        ('close', first),
+        ('create', second),
+    ]
+
+
+def test_native_reset_does_not_move_when_gripper_open_fails(monkeypatch):
+    operator = make_native_operator(monkeypatch)
+    first = FakeNativeEnv.instances[-1]
+
+    def fail_to_open(**kwargs):
+        del kwargs
+        raise RuntimeError('gripper unavailable')
+
+    first.robot.set_gripper = fail_to_open
+    with pytest.raises(RuntimeError, match='gripper unavailable'):
+        operator.reset_native_env()
+
+    assert first.closed is False
+    assert operator.native_env is first
+    assert FakeNativeEnv.instances == [first]
+
+
+def test_plain_runner_delegates_prepare_pose_to_native_reset():
+    reset_calls = []
+    runner = Tron2InferenceRunner.__new__(Tron2InferenceRunner)
+    runner.ros_operator = type(
+        'NativeResetOperator', (),
+        {'reset_native_env': lambda self: reset_calls.append(True)})()
+    runner.dry_run = False
+    runner.last_actions = np.ones((2, 16))
+
+    runner._move_to_prepare_pose()
+
+    assert reset_calls == [True]
+    assert runner.last_actions is None
 
 
 class FakeBridgeProvider:

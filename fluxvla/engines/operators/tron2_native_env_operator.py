@@ -54,6 +54,7 @@ class Tron2NativeEnvOperator:
         init_head=None,
         init_ee_z_min: Optional[float] = -0.6,
         init_gripper_opening: float = 1.0,
+        reset_gripper_open_wait_s: float = 0.5,
         state_queue_maxlen: int = 7,
         state_polling_rate: float = 200.0,
         connection_timeout: float = 5.0,
@@ -65,6 +66,13 @@ class Tron2NativeEnvOperator:
                 f'{bridge_state_source!r}.')
         if state_dim not in {16, 18}:
             raise ValueError(f'state_dim must be 16 or 18, got {state_dim}.')
+        if (isinstance(reset_gripper_open_wait_s, bool)
+                or not isinstance(reset_gripper_open_wait_s, (int, float))
+                or not np.isfinite(reset_gripper_open_wait_s)
+                or reset_gripper_open_wait_s < 0):
+            raise ValueError('reset_gripper_open_wait_s must be finite and '
+                             '>= 0, got '
+                             f'{reset_gripper_open_wait_s!r}.')
 
         self._env_kwargs = dict(
             robot_ip=str(robot_ip),
@@ -90,6 +98,7 @@ class Tron2NativeEnvOperator:
             state_polling_rate=float(state_polling_rate),
             connection_timeout=float(connection_timeout),
         )
+        self._reset_gripper_open_wait_s = float(reset_gripper_open_wait_s)
         self._lock = threading.RLock()
         self._issued_action_callback = None
         self._env = None
@@ -214,10 +223,121 @@ class Tron2NativeEnvOperator:
                 action_metadata=dict(action_metadata or {}),
             )
 
+    def execute_trajectory(self,
+                           left_arm_trajectory,
+                           right_arm_trajectory,
+                           left_gripper_trajectory,
+                           right_gripper_trajectory,
+                           head_trajectory=None,
+                           dt: float = 1.0 / 30.0,
+                           async_exec: bool = False,
+                           action_metadata=None) -> None:
+        """Feed a complete non-RTC chunk through upstream ``step`` calls.
+
+        ``Tron2InferenceRunner`` submits a trajectory, whereas the RTC runner
+        submits individual waypoints.  Both paths deliberately converge on
+        :meth:`execute_waypoint` so action layout, head passthrough, gripper
+        handling and issued-action recording remain identical.
+        """
+        if async_exec:
+            raise ValueError(
+                'Tron2NativeEnvOperator only supports synchronous trajectory '
+                'execution. Set inference.async_execution=False.')
+        if (isinstance(dt, bool) or not isinstance(dt, (int, float))
+                or not np.isfinite(dt) or dt <= 0):
+            raise ValueError(f'dt must be finite and > 0, got {dt!r}.')
+
+        left = np.asarray(left_arm_trajectory, dtype=np.float64)
+        right = np.asarray(right_arm_trajectory, dtype=np.float64)
+        left_gripper = np.asarray(
+            left_gripper_trajectory, dtype=np.float64).reshape(-1)
+        right_gripper = np.asarray(
+            right_gripper_trajectory, dtype=np.float64).reshape(-1)
+        if left.ndim != 2 or left.shape[1] != 7:
+            raise ValueError('left_arm_trajectory must have shape [T, 7], '
+                             f'got {left.shape}.')
+        if right.ndim != 2 or right.shape[1] != 7:
+            raise ValueError('right_arm_trajectory must have shape [T, 7], '
+                             f'got {right.shape}.')
+
+        count = left.shape[0]
+        expected_vector_shape = (count, )
+        if right.shape[0] != count:
+            raise ValueError(
+                'Arm trajectories must contain the same number of frames; '
+                f'got left={count}, right={right.shape[0]}.')
+        if left_gripper.shape != expected_vector_shape:
+            raise ValueError(
+                'left_gripper_trajectory must contain one value per frame; '
+                f'expected {expected_vector_shape}, got '
+                f'{left_gripper.shape}.')
+        if right_gripper.shape != expected_vector_shape:
+            raise ValueError(
+                'right_gripper_trajectory must contain one value per frame; '
+                f'expected {expected_vector_shape}, got '
+                f'{right_gripper.shape}.')
+
+        head = None
+        if head_trajectory is not None:
+            head = np.asarray(head_trajectory, dtype=np.float64)
+            if head.shape != (count, 2):
+                raise ValueError('head_trajectory must have shape [T, 2]; '
+                                 f'expected {(count, 2)}, got {head.shape}.')
+
+        named_arrays = {
+            'left_arm_trajectory': left,
+            'right_arm_trajectory': right,
+            'left_gripper_trajectory': left_gripper,
+            'right_gripper_trajectory': right_gripper,
+        }
+        if head is not None:
+            named_arrays['head_trajectory'] = head
+        for name, values in named_arrays.items():
+            if not np.all(np.isfinite(values)):
+                raise ValueError(f'{name} contains non-finite values.')
+
+        start = time.perf_counter()
+        for index in range(count):
+            self.execute_waypoint(
+                left_arm=left[index],
+                right_arm=right[index],
+                left_gripper=float(left_gripper[index]),
+                right_gripper=float(right_gripper[index]),
+                head=None if head is None else head[index],
+                dt=float(dt),
+                action_metadata=action_metadata,
+                trajectory_index=index,
+            )
+            deadline = start + (index + 1) * float(dt)
+            remaining = deadline - time.perf_counter()
+            if remaining > 0:
+                time.sleep(remaining)
+
     def reset_native_env(self) -> None:
-        """Recreate Tron2Env so upstream bring-up runs exactly as at startup."""
+        """Open both grippers, then recreate the upstream environment.
+
+        Upstream environment construction performs the configured MoveJ
+        bring-up and opens the grippers only afterwards.  The idle ``r`` path
+        first opens them through the still-connected old environment so the
+        arms do not carry a grasped object through the reset trajectory.
+        """
         with self._lock:
             old_env = self._require_env()
+            robot = getattr(old_env, 'robot', None)
+            set_gripper = getattr(robot, 'set_gripper', None)
+            if not callable(set_gripper):
+                raise RuntimeError(
+                    'Native Tron2Env does not expose robot.set_gripper; '
+                    'refusing to MoveJ before opening both grippers.')
+            opening = float(
+                np.clip(self._env_kwargs['init_gripper_opening'], 0.0, 1.0) *
+                100.0)
+            set_gripper(
+                left_opening=opening,
+                right_opening=opening,
+            )
+            if self._reset_gripper_open_wait_s > 0:
+                time.sleep(self._reset_gripper_open_wait_s)
             old_env.close()
             self._env = None
             self._env = self._create_env()

@@ -1021,6 +1021,16 @@ class Tron2InferenceRunner(BaseInferenceRunner):
         - 16-dim: left7 + left_gripper + right7 + right_gripper
         - List of 18-dim lists: execute each pose sequentially
         """
+        reset_native_env = getattr(self.ros_operator, 'reset_native_env', None)
+        if callable(reset_native_env):
+            if self.dry_run:
+                print(
+                    '[Tron2InferenceRunner] dry_run=True, skip native reset.')
+                return
+            reset_native_env()
+            self.last_actions = None
+            return
+
         if self.dry_run:
             print('[Tron2InferenceRunner] dry_run=True, skip prepare pose.')
             return

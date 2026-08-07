@@ -1407,3 +1407,42 @@ commands and results that were actually executed.
   instance restart. No newer checkpoint candidate could be listed or
   transferred. The existing local 22k checkpoint and reconstructed config
   were not modified. No training, inference or robot process was started.
+
+## 2026-08-07 07:47 CST — Support non-RTC chunks in the native operator
+
+- Diagnosed a deployment-only interface mismatch after selecting
+  `Tron2InferenceRunner` to disable inference-time RTC. The ordinary runner
+  submits complete chunks through `execute_trajectory`, while the new native
+  `tron2_env` adapter only exposed the RTC runner's per-frame
+  `execute_waypoint` method. Model loading and task metadata were valid; the
+  first chunk failed before any action was submitted.
+- Added synchronous native trajectory execution. The adapter validates every
+  arm, gripper and optional-head array before issuing the first frame, then
+  feeds each waypoint through the same upstream `Tron2Env.step()` path at the
+  configured policy period. A 16-D chunk continues to omit head commands, and
+  asynchronous trajectory mode is rejected explicitly because this local
+  profile configures synchronous execution.
+- Added hardware-free coverage for 30 Hz pacing, per-frame recording metadata,
+  the 16-D head-free action layout, pre-execution shape rejection and the
+  asynchronous-mode guard. Python compilation, `git diff --check`, and the
+  combined operator/config regression selection passed all 61 tests with five
+  existing third-party warnings. No model, Bridge or robot connection was
+  used during validation.
+
+## 2026-08-07 13:51 CST — Open grippers before idle reset MoveJ
+
+- Confirmed that upstream `tron2_env` performs its construction-time reset as
+  MoveJ first and gripper-open second. Changed only the idle `r` reset path:
+  it now opens both grippers through the still-connected old native
+  environment, waits the configured 0.5 seconds, then closes ServoJ and
+  reconstructs `Tron2Env` for the original MoveJ bring-up. Startup
+  initialization and running-task key restrictions are unchanged.
+- A failed gripper-open request aborts reset before the old environment is
+  closed or any new MoveJ environment is created. Added the native reset hook
+  to the ordinary `Tron2InferenceRunner` as well, so RTC and non-RTC keyboard
+  modes share the same order and neither relies on the legacy
+  `move_to_targets` interface.
+- Documented `reset_gripper_open_wait_s=0.5` and the new safety order. Python
+  compilation, `git diff --check`, and the combined operator/config selection
+  passed all 63 tests with five existing third-party warnings. Validation used
+  fake environments only; no model, Bridge or robot connection was made.

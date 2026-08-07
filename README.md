@@ -643,7 +643,10 @@ sequence previously exposed as task ID `0`:
 
 `r` is ignored while a task is running; press `s`, wait until the client
 reports idle, and only then press `r`. In dry-run mode, prepare-pose execution
-is skipped. In real execution mode,
+is skipped. The native reset first opens both grippers through the still
+connected environment and waits 0.5 seconds; only then does it disconnect
+ServoJ and start the MoveJ bring-up. A gripper-open failure blocks MoveJ. In
+real execution mode,
 each prepare pose uses MoveJ and does not send a head target. Before the first
 policy action, the full chunk is checked against both Bridge and control
 feedback before a fresh `tron2_env` MotionController may stream ServoJ at

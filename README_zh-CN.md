@@ -600,6 +600,8 @@ chunk 切换不会重启 30 Hz consumer 或 300 Hz `MotionController`。队列�
 这个终端。按 `s` 后，runner 按公开客户端语义停止 producer/consumer，300 Hz
 控制器保持最后目标；回到 idle 后才能按 `r`。`r` 会关闭并重建公开
 `Tron2Env`，由其原生初始化流程执行 MoveJ；配置不发送头部初始化目标。
+重建前会先通过仍连接的旧环境打开双夹爪并等待 0.5 秒，然后才断开 ServoJ
+并执行 MoveJ 归位；开夹爪失败时不会继续归位。
 
 日志同时打印 `d`、`prefix`、`meas` 和 `used`。其中 `d` 是下一次模型请求的
 动态延时，`prefix` 是离散量化结果，`meas` 是本次实测耗时帧数，`used` 是

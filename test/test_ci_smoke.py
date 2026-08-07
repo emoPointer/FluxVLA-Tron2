@@ -127,6 +127,7 @@ def test_tron2_rtc_local_inference_config():
     assert inference.operator.fps == 30.0
     assert inference.operator.publish_rate == 300.0
     assert inference.operator.init_head is None
+    assert inference.operator.reset_gripper_open_wait_s == 0.5
     expected_training_rtc = {
         'enabled': True,
         'max_delay': 20,
